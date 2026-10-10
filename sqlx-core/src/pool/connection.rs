@@ -15,6 +15,32 @@ use crate::pool::options::PoolConnectionMetadata;
 
 const CLOSE_ON_DROP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound for one step of the on-release connection check.
+///
+/// Neither `Connection::ping()` nor a graceful `Connection::close()` carries a
+/// timeout of its own: the Postgres `ping()` is a raw socket read loop until
+/// `ReadyForQuery` (`sqlx-postgres/src/connection/mod.rs`), and `close()` waits
+/// for the terminator round trip. An unresponsive server would otherwise park
+/// the releasing task forever — and this runs in a spawned task, so nothing
+/// else notices. Named for the ping because that is the step this bound was
+/// added for; the `close()` calls on the same path share it, since they are the
+/// same "give the server this long, then move on" budget. 5s matches the
+/// neighbouring `CLOSE_ON_DROP_TIMEOUT`.
+///
+/// Accepted trade: the bound measures from the executor giving up, not from the
+/// server going idle, so a connection can be hard-closed while a statement is
+/// still running server-side. A caller that drops a query future mid-flight
+/// leaves the server draining it, and five seconds later this bound closes the
+/// connection and the server aborts what was left. The consumer facts the trade
+/// rests on: the admin path, where the long queries are, caps them at 10s via
+/// `BILLING_ADMIN_STATEMENT_TIMEOUT_SECONDS` (`billing` `src/config.rs:665-683`);
+/// the job-hook queries set their own clamped `statement_timeout`
+/// (`billing` `src/jobs.rs:1139-1150`); and the HTTP application path sets
+/// none — that last case is what this bound is for. Unbounded is not the
+/// alternative to weigh: it turns one slow query into a pool slot that is never
+/// reclaimed.
+const RELEASE_PING_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A connection managed by a [`Pool`][crate::pool::Pool].
 ///
 /// Will be returned to the pool on-drop.
@@ -275,14 +301,14 @@ impl<DB: Database> Floating<DB, Live<DB>> {
     async fn return_to_pool(mut self) -> bool {
         // Immediately close the connection.
         if self.guard.pool.is_closed() {
-            self.close().await;
+            self.close_bounded().await;
             return false;
         }
 
         // If the connection is beyond max lifetime, close the connection and
         // immediately create a new connection
         if is_beyond_max_lifetime(&self.inner, &self.guard.pool.options) {
-            self.close().await;
+            self.close_bounded().await;
             return false;
         }
 
@@ -291,14 +317,23 @@ impl<DB: Database> Floating<DB, Live<DB>> {
             match (test)(&mut self.inner.raw, meta).await {
                 Ok(true) => (),
                 Ok(false) => {
-                    self.close().await;
+                    self.close_bounded().await;
                     return false;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "error from `after_release`");
                     // Connection is broken, don't try to gracefully close as
                     // something weird might happen.
-                    self.close_hard().await;
+                    //
+                    // Drop rather than `close_hard().await`: `close_hard()`
+                    // reaches `BufferedSocket::shutdown()`, which starts with
+                    // `flush()` on the same write buffer that is unflushable
+                    // whenever the peer has stopped reading
+                    // (`sqlx-core/src/net/socket/buffered.rs:137`), so awaiting
+                    // it here would park with the permit still held. Dropping
+                    // closes the socket and releases the size guard
+                    // synchronously, with no await to block on.
+                    drop(self);
                     return false;
                 }
             }
@@ -311,14 +346,42 @@ impl<DB: Database> Floating<DB, Live<DB>> {
         // returned to the pool; also of course, if it was dropped due to an error
         // this is simply a band-aid as SQLx-next connections should be able
         // to recover from cancellations
-        if let Err(error) = self.raw.ping().await {
-            tracing::warn!(
-                %error,
-                "error occurred while testing the connection on-release",
-            );
+        //
+        // `ping()` is an un-timed read loop, so bound it: an unresponsive server
+        // must not park the releasing task here forever.
+        let ping_failed = match crate::rt::timeout(RELEASE_PING_TIMEOUT, self.raw.ping()).await {
+            Ok(Ok(())) => false,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %error,
+                    "error occurred while testing the connection on-release",
+                );
 
+                true
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "on-release connection test timed out after {:?}",
+                    RELEASE_PING_TIMEOUT,
+                );
+
+                true
+            }
+        };
+
+        if ping_failed {
             // Connection is broken, don't try to gracefully close.
-            self.close_hard().await;
+            //
+            // In particular, do NOT `close_hard().await` here. `close_hard()`
+            // ends in `BufferedSocket::shutdown()`, which begins with
+            // `flush()` on the very write buffer `ping()` just failed to drain
+            // (`sqlx-core/src/net/socket/buffered.rs:137`): against a peer that
+            // ACKs but stops reading, that flush parks forever with the permit
+            // still held, so the bound would only have moved the hang from
+            // `ping()` to the close. Dropping the `Floating` closes the socket
+            // and releases the size guard synchronously — no await at all —
+            // which is also what "don't try to gracefully close" means here.
+            drop(self);
             false
         } else {
             // if the connection is still viable, release it to the pool
@@ -327,15 +390,26 @@ impl<DB: Database> Floating<DB, Live<DB>> {
         }
     }
 
+    /// Gracefully close the connection, but never wait on the server for longer
+    /// than [`RELEASE_PING_TIMEOUT`].
+    ///
+    /// `Floating::close()` discards the error from `Connection::close()`, so an
+    /// abandoned close is treated the same way: the timeout future is dropped,
+    /// which drops the connection and, with it, the size guard — releasing the
+    /// pool slot. That matches the "proceed on a failed close" semantics the rest
+    /// of this file already uses (see `PoolConnection::take_and_close`, which
+    /// bounds the same call with `CLOSE_ON_DROP_TIMEOUT`).
+    async fn close_bounded(self) {
+        crate::rt::timeout(RELEASE_PING_TIMEOUT, self.close())
+            .await
+            .ok();
+    }
+
     pub async fn close(self) {
         // This isn't used anywhere that we care about the return value
         let _ = self.inner.raw.close().await;
 
         // `guard` is dropped as intended
-    }
-
-    pub async fn close_hard(self) {
-        let _ = self.inner.raw.close_hard().await;
     }
 
     pub fn detach(self) -> DB::Connection {
