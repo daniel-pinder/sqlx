@@ -21,10 +21,13 @@ ipaddr.so
 # Temporary files from running the tests locally like they would be run from CI
 .sqlx
 
-# Checking-in a `Cargo.lock` is not that helpful for a published package:
-# * Requires manual `cargo update` frequently to test with new versions
-# * `cargo install sqlx-cli` uses latest deps anyways unless `--locked` is passed
-# * Libraries don't really need reproducible builds
-# * Should also check with `-Z direct-minimal-versions` (which our CI does)
-# * PRs which add/remove/update deps cause churn which results in annyoing merge conflicts
-Cargo.lock
+# Cargo.lock IS TRACKED in this fork — a deliberate divergence from upstream,
+# which gitignores it (their listed reasons: dependency churn, `cargo install
+# sqlx-cli` picking latest deps unless --locked, "libraries don't really need
+# reproducible builds"). The fork's fleet CI invokes cargo with --locked
+# everywhere (the rust-service lanes, and tests/ci-cheap.sh / ci-verify.sh),
+# which refuses to create a missing lock file — measured: "cannot create the
+# lock file ... because --locked was passed" — and the seven published
+# crates' registry bytes resolve from exactly this lock. The fork's
+# lifecycle is publish-once, then drop when upstream releases both pool
+# bounds, so the churn upstream avoids cannot occur here.
