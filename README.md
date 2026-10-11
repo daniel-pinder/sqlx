@@ -27,6 +27,12 @@ that registry — no git source in the Rust build path. The version is
 published **once**, from the reviewed bytes: any later fix-up needs a new
 upstream-compatible version, and a yank is the only retraction.
 
+**Publish order** (each `cargo publish -p <crate> --registry fibretel`
+verifies against the index, so a crate must be visible there before its
+dependents): `sqlx-core`; then `sqlx-mysql`, `sqlx-postgres`,
+`sqlx-sqlite`; then `sqlx-macros-core`, `sqlx-macros`, and the `sqlx`
+facade.
+
 ## The bridge ends when upstream carries the fix
 
 Drop the patch, drop the registry pin, and follow upstream. The upstream

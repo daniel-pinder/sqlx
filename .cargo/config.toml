@@ -1,12 +1,19 @@
 # The workspace's mutual sqlx dependencies name the fibretel registry (the
 # publish wiring), so every cargo invocation in this repository must be able
 # to resolve `fibretel`; without an index defined, manifest parsing fails with
-# "registry index was not found in any configuration: fibretel". Forgejo's
-# package registry requires auth even for reads, so the token comes from the
-# build host's ~/.cargo/credentials.toml or CARGO_REGISTRIES_FIBRETEL_TOKEN —
-# never committed here. CI sets both variables itself.
+# "registry index was not found in any configuration: fibretel".
+#
+# The index is kellnr (crates.fibretel.network), the fleet's private cargo
+# registry; the Forgejo packages endpoint this file used to name is being
+# retired. Kellnr requires auth even for reads (measured: an unauthenticated
+# GET of config.json answers 401), so the token comes from the build host's
+# ~/.cargo/credentials.toml or CARGO_REGISTRIES_FIBRETEL_TOKEN — never
+# committed here (see .gitignore: /.cargo/credentials*). CI sets both
+# variables itself.
+#
+# The credential provider is scoped to this registry rather than declared as
+# a global [registry] global-credential-providers: the scoped form is the
+# same grant, applied only to the registry that needs it.
 [registries.fibretel]
-index = "sparse+https://git.fibretel.network/api/packages/fibretel/cargo/"
-
-[registry]
-global-credential-providers = ["cargo:token"]
+index = "sparse+https://crates.fibretel.network/api/v1/crates/"
+credential-provider = ["cargo:token"]

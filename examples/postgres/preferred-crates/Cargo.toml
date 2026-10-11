@@ -1,5 +1,6 @@
 [package]
 name = "sqlx-example-postgres-preferred-crates"
+publish = false
 version.workspace = true
 license.workspace = true
 edition.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "sqlx-example-sqlite-serialize"
+publish = false
 version = "0.1.0"
 edition = "2024"
 workspace = "../../../"

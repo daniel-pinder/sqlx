@@ -1,5 +1,6 @@
 [package]
 name = "sqlx-example-postgres-files"
+publish = false
 version = "0.1.0"
 edition = "2021"
 

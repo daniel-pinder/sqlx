@@ -31,3 +31,6 @@ ipaddr.so
 # crates' registry bytes resolve from exactly this lock. The fork's
 # lifecycle is publish-once, then drop when upstream releases both pool
 # bounds, so the churn upstream avoids cannot occur here.
+
+# Never track cargo registry credentials, whichever provider writes them.
+/.cargo/credentials*

@@ -57,6 +57,12 @@ repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+# The fork's gate scripts live under tests/ as repo furniture and are NOT
+# part of upstream's v0.9.0 archive; publish-once means they cannot be
+# removed from a .crate after the fact. Proven absent with
+# `cargo package -p sqlx --list`.
+exclude = ["tests/ci-*.sh"]
+
 # Note: written so that it may be copy-pasted to other crates
 [package.metadata.docs.rs]
 features = ["_unstable-docs"]
@@ -176,8 +182,10 @@ sqlx-mysql = { version = "=0.9.0", registry = "fibretel", path = "sqlx-mysql", d
 sqlx-postgres = { version = "=0.9.0", registry = "fibretel", path = "sqlx-postgres" }
 sqlx-sqlite = { version = "=0.9.0", registry = "fibretel", path = "sqlx-sqlite" }
 
-# Facade crate (for reference from sqlx-cli)
-sqlx = { version = "=0.9.0", path = ".", default-features = false }
+# Facade crate (for reference from sqlx-cli). Carries the registry like the
+# six above so that any consumer packaging from this workspace (all are
+# publish = false today) can never normalize its sqlx edge to crates.io.
+sqlx = { version = "=0.9.0", registry = "fibretel", path = ".", default-features = false }
 
 # Common type integrations shared by multiple driver crates.
 # These are optional unless enabled in a workspace crate.
