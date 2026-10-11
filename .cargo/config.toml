@@ -1,0 +1,12 @@
+# The workspace's mutual sqlx dependencies name the fibretel registry (the
+# publish wiring), so every cargo invocation in this repository must be able
+# to resolve `fibretel`; without an index defined, manifest parsing fails with
+# "registry index was not found in any configuration: fibretel". Forgejo's
+# package registry requires auth even for reads, so the token comes from the
+# build host's ~/.cargo/credentials.toml or CARGO_REGISTRIES_FIBRETEL_TOKEN —
+# never committed here. CI sets both variables itself.
+[registries.fibretel]
+index = "sparse+https://git.fibretel.network/api/packages/fibretel/cargo/"
+
+[registry]
+global-credential-providers = ["cargo:token"]
