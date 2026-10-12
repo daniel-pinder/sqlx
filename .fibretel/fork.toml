@@ -1,0 +1,23 @@
+# .fibretel/fork.toml — the reviewed fork declaration consumed by the
+# archetype lane's fork-patched-crates lint scope (ci-templates !373 /
+# b9222b75, input RUST_FORK_PATCHED_CRATES) and paired with ci-config's
+# gated-narrowing exceptions record (ci-config !170,
+# projects/sqlx-fibretel/options.yml). Daniel's decision 2026-10-11 07:06
+# ("Take your recommended on the fork ci.", recorded on billing-1e0j): a
+# temporary fork of a third-party library is lint-gated on the code WE
+# authored — clippy -D warnings on the patched crate, sqlx-core — and must
+# still BUILD for the rest; upstream's unchanged bytes are never amended to
+# satisfy our lints.
+#
+# The lane honours the narrowed scope only when its input value EQUALS this
+# declaration, read from the commit (tracked, regular file, git show HEAD:),
+# so both values here are reviewed content: any change is a review event.
+#
+# upstream: exactly what `git remote get-url upstream` reports for this
+# checkout (the canonical repository, renamed from launchbadge/sqlx to
+# transact-rs/sqlx; the Cargo.toml `repository` field still spells the
+# pre-rename slug, which GitHub redirects).
+upstream = "https://github.com/transact-rs/sqlx.git"
+# The one crate this fork patches (commit ecbfc25d: bound the on-release ping
+# and the close() join). Must be a workspace member.
+patched_crates = ["sqlx-core"]
