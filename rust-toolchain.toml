@@ -1,4 +1,15 @@
 # Note: should NOT increase during a minor/patch release cycle
+#
+# FibreTel bridge fork: repinned to the fleet toolchain, 1.97.1, on the
+# 2026-10-11 ruling on billing-1e0j. The fleet runner image bakes
+# 1.97.1/1.98.0/1.98.1/1.99.0 and cannot resolve upstream's channel 1.94 at
+# job time — RUSTUP_HOME is root-owned and read-only to the job user, so every
+# Rust job died on `info: syncing channel updates for 1.94` /
+# `could not create temp file /usr/local/rustup/tmp/...: Permission denied`
+# (reproduced against the pipeline's own image digest). This file is
+# repository CI configuration, not part of any published .crate: the =0.9.0
+# bytes are unchanged, and the upstream PR branch is untouched.
 [toolchain]
-channel = "1.94"
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
 profile = "minimal"
