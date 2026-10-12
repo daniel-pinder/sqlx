@@ -1,0 +1,87 @@
+# cargo-deny policy for the FibreTel bridge fork of sqlx (v0.9.0 base plus one
+# patch commit). Modeled on the fleet baseline: fibretel-rs/deny.toml and
+# billing/deny.toml. Enforced unconditionally by the ci-config rust-cheap
+# component's "reject a missing deny.toml" step, which refuses a configless run
+# because cargo-deny without one uses yanked = "warn" and still reports
+# success. Re-check against `cargo deny --version` docs before editing; don't
+# carry a stale option name forward.
+#
+# This tree is UPSTREAM's, and the fork rule (Daniel, 2026-10-11) forbids
+# changing upstream source to make a gate pass — so everything below is either
+# the fleet posture itself (yanked deny) or an explicit, reasoned acceptance of
+# something upstream ships. Every entry names the dependency path that carries
+# it in THIS lockfile; none is written from memory.
+
+[advisories]
+yanked = "deny"
+# The burst lane has no route to github.com, where cargo-deny's default
+# advisory database lives; every job must read the GitLab pull mirror instead.
+# The ci-config admission step parses this file and requires EXACTLY this one
+# url — equality, not membership: the lane fetches every url listed, so a
+# longer list would be an unreviewed advisory database.
+db-urls = ["https://gitlab.fibretel.network/upstream/rustsec-advisory-db.git"]
+ignore = [
+    # RUSTSEC-2025-0052 (async-std discontinued). Path in this lock:
+    # (dev) sqlx -> async-std 1.13.2. DEV-dependency of the sqlx test suite
+    # only — it is in no published crate's runtime graph, and the advisory
+    # itself offers no safe upgrade ("No safe upgrade is available!"). Swapping
+    # the test runtime is upstream's decision, not the fork's to carry.
+    { id = "RUSTSEC-2025-0052", reason = "dev-dependency of the sqlx test suite only ((dev) sqlx -> async-std 1.13.2), absent from every published crate's runtime graph; no safe upgrade per the advisory, and replacing it is an upstream change the fork must not carry" },
+    # RUSTSEC-2024-0436 (paste unmaintained, not a vulnerability). Path in this
+    # lock: (dev) sqlx -> paste 1.0.15 — build-time proc-macro, test-only
+    # here. Same advisory, same provisional-accept shape as the fleet
+    # baseline's utoipa-axum ignore; "no safe upgrade is available", and the
+    # swap is upstream's.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained, not vulnerable: dev-dependency of the sqlx test suite ((dev) sqlx -> paste 1.0.15), build-time proc-macro only; paste has no upgrade path per the advisory itself, and the swap belongs upstream" },
+    # RUSTSEC-2023-0071 (Marvin Attack: RSA timing side-channel). Path in this
+    # lock: sqlx-mysql -> rsa 0.10.0-rc.19 — the MySQL backend's
+    # caching_sha2_password handshake. FibreTel consumes sqlx-postgres, the
+    # issued line is fixed at =0.9.0 (publish-once), and the advisory carries
+    # patched = [] deliberately: no safe upgrade exists. Provisional accept,
+    # same shape as the jsonwebtoken ignore in billing/fibretel-rs — revisit
+    # when upstream sqlx moves off `rsa`.
+    { id = "RUSTSEC-2023-0071", reason = "MySQL-backend-only path (sqlx-mysql -> rsa 0.10.0-rc.19, caching_sha2_password handshake); FibreTel consumes sqlx-postgres, the version is fixed at =0.9.0, and the advisory has no patched release — provisional accept, revisit when upstream sqlx moves off rsa" },
+]
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+# Per-crate exceptions, exactly the fleet baseline's style: scoped to the
+# reviewed crate rather than widening the allow list for every future
+# dependency that happens to pick one of these.
+#
+#   foldhash (Zlib) — transitive: sqlx-postgres -> hashbrown -> foldhash. Same
+#     crate and reason as fibretel-rs's and billing's exception.
+#   webpki-roots (CDLA-Permissive-2.0) — Mozilla's CA root bundle as data, the
+#     standard license for this crate family across the rustls ecosystem; same
+#     exception as the fleet baseline. (The sibling `webpki-root-certs` the
+#     fleet also lists is not in this lock, so it is not carried here.)
+#   terminfo (WTFPL) — transitive via termwiz (sqlx-cli's terminal stack). The
+#     WTFPL is a permissive (if informally worded) public-domain-style license;
+#     scoped here rather than added to the fleet allow list.
+#   finl_unicode / wezterm-bidi (Unicode-DFS-2016) — also via termwiz. The
+#     Unicode DFS license is the predecessor of Unicode-3.0 (which the allow
+#     list already carries); scoped per crate for the same reason.
+exceptions = [
+    { allow = ["Zlib"], crate = "foldhash" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    { allow = ["WTFPL"], crate = "terminfo" },
+    { allow = ["Unicode-DFS-2016"], crate = "finl_unicode" },
+    { allow = ["Unicode-DFS-2016"], crate = "wezterm-bidi" },
+]
+
+[licenses.private]
+# The workspace's own crates are private: the sqlx-* members are
+# `publish = ["fibretel"]` (the publish wiring, never crates.io) and sqlx-test
+# and the examples are `publish = false`. cargo-deny only treats a crate as
+# private when it is unpublishable OR publishable solely to registries listed
+# here — the same reasoning (and the same `registries` list) as
+# fibretel-rs/deny.toml, whose ftl-* crates are published the same way.
+ignore = true
+registries = ["fibretel"]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
