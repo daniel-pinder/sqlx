@@ -268,7 +268,7 @@ impl PgListener {
         let mut close_event = (!self.ignore_close_event).then(|| self.pool.close_event());
 
         loop {
-            let next_message = self.connection().await?.inner.stream.recv_unchecked();
+            let next_message = self.connection().await?.inner.stream.recv_unchecked_idle();
 
             let res = if let Some(ref mut close_event) = close_event {
                 // cancels the wait and returns `Err(PoolClosed)` if the pool is closed

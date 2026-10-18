@@ -1,7 +1,7 @@
 # sqlx-fibretel — agent notes
 
 A **bridge fork** of upstream sqlx: base `v0.9.0`
-(`75bc0487eb661da811bb7a3c5d158f1bd463fef4`), one patch commit on top,
+(`75bc0487eb661da811bb7a3c5d158f1bd463fef4`), two upstream-shaped patches on top,
 upstreamable as-is. See `README.md` for what the patch does.
 
 ## Rules
@@ -17,8 +17,8 @@ upstreamable as-is. See `README.md` for what the patch does.
 - **Publication is publish-once.** FibreTel consumes the seven `sqlx-*`
   crates from its private registry at exactly `=0.9.0`, from these bytes;
   a later fix-up needs a new upstream-compatible version.
-- **Tests:** `cargo test -p sqlx-core` — the three pool-bound tests drive
-  in-memory SQLite and need no database server.
+- **Tests:** `bash tests/ci-verify.sh` — pool bounds use in-memory SQLite;
+  socket bounds use scripted loopback peers. Neither needs a database server.
 - **The upstream PR** is opened by Daniel, not by an agent.
 
 `AGENTS.md` is a symlink to this file (Codex reads `AGENTS.md`, Claude and

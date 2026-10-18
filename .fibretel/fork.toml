@@ -5,7 +5,7 @@
 # projects/sqlx-fibretel/options.yml). Daniel's decision 2026-10-11 07:06
 # ("Take your recommended on the fork ci.", recorded on billing-1e0j): a
 # temporary fork of a third-party library is lint-gated on the code WE
-# authored — clippy -D warnings on the patched crate, sqlx-core — and must
+# authored — clippy -D warnings on sqlx-core and sqlx-postgres — and must
 # still BUILD for the rest; upstream's unchanged bytes are never amended to
 # satisfy our lints.
 #
@@ -18,6 +18,6 @@
 # transact-rs/sqlx; the Cargo.toml `repository` field still spells the
 # pre-rename slug, which GitHub redirects).
 upstream = "https://github.com/transact-rs/sqlx.git"
-# The one crate this fork patches (commit ecbfc25d: bound the on-release ping
-# and the close() join). Must be a workspace member.
-patched_crates = ["sqlx-core"]
+# Patched crates: pool release/close bounds and configurable socket I/O bounds.
+# Every entry must be a workspace member.
+patched_crates = ["sqlx-core", "sqlx-postgres"]

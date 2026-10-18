@@ -4,6 +4,7 @@ use sqlx_core::percent_encoding::{percent_decode_str, utf8_percent_encode, NON_A
 use sqlx_core::Url;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
 impl PgConnectOptions {
     pub(crate) fn parse_from_url(url: &Url) -> Result<Self, Error> {
@@ -64,6 +65,17 @@ impl PgConnectOptions {
                 "statement-cache-capacity" => {
                     options =
                         options.statement_cache_capacity(value.parse().map_err(Error::config)?);
+                }
+
+                "socket-timeout" => {
+                    let seconds = value.parse::<f64>().map_err(Error::config)?;
+                    let timeout = Duration::try_from_secs_f64(seconds).map_err(Error::config)?;
+                    if timeout.is_zero() {
+                        return Err(Error::Configuration(
+                            "socket-timeout must be greater than zero; omit it to disable the timeout".into(),
+                        ));
+                    }
+                    options = options.socket_timeout(timeout);
                 }
 
                 "host" => {
@@ -165,6 +177,11 @@ impl PgConnectOptions {
             "statement-cache-capacity",
             &self.statement_cache_capacity.to_string(),
         );
+
+        if let Some(timeout) = self.socket_timeout {
+            url.query_pairs_mut()
+                .append_pair("socket-timeout", &timeout.as_secs_f64().to_string());
+        }
 
         url
     }

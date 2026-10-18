@@ -28,6 +28,11 @@ mod describe;
 mod establish;
 mod executor;
 mod resolve;
+// Keep the vendored upstream SASL implementation byte-identical to its baseline.
+#[allow(
+    clippy::useless_borrows_in_formatting,
+    reason = "unchanged upstream SASL code"
+)]
 mod sasl;
 mod stream;
 mod tls;

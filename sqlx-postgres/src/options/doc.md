@@ -45,9 +45,13 @@ if a parameter is not passed in via URL, it is populated by reading
 SQLx also parses some bespoke parameters. These are _not_ configurable by environment variable.
 Instead, the name is linked to the method to set the value.
 
-| Parameter                                                    | Default                       |
-|--------------------------------------------------------------|-------------------------------|
-| [`statement-cache-capacity`][Self::statement_cache_capacity] | `100`                         |
+| Parameter                                                    | Default           |
+|--------------------------------------------------------------|-------------------|
+| [`statement-cache-capacity`][Self::statement_cache_capacity] | `100`             |
+| [`socket-timeout`][Self::socket_timeout]                     | Unset (unbounded) |
+
+`socket-timeout` is a positive number of seconds, including fractional seconds.
+Omit it for unbounded I/O; zero is rejected.
 
 # Example URLs
 ```text

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::env::var;
 use std::fmt::{self, Display, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub use ssl_mode::PgSslMode;
 
@@ -18,6 +19,7 @@ pub struct PgConnectOptions {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) socket: Option<PathBuf>,
+    pub(crate) socket_timeout: Option<Duration>,
     pub(crate) username: String,
     pub(crate) password: Option<String>,
     pub(crate) database: Option<String>,
@@ -79,6 +81,7 @@ impl PgConnectOptions {
             port,
             host,
             socket: None,
+            socket_timeout: None,
             username,
             password: var("PGPASSWORD").ok(),
             database,
@@ -341,6 +344,39 @@ impl PgConnectOptions {
     pub fn ssl_root_cert_from_pem(mut self, pem_certificate: Vec<u8>) -> Self {
         self.ssl_root_cert = Some(CertificateInput::Inline(pem_certificate));
         self
+    }
+
+    /// Set the inactivity timeout for each socket read, write, flush and shutdown wait.
+    ///
+    /// Also applies one total deadline to connection setup (DNS, TCP and TLS negotiation).
+    /// If it elapses, the connection returns an I/O error of kind `TimedOut` carrying
+    /// [`sqlx_core::error::SocketTimedOut`] and cannot be reused.
+    ///
+    /// Defaults to `None` (unbounded). Choose a value above server-side statement
+    /// and transaction timeouts. Idle notification waits and COPY IN's user-provided
+    /// data source are not bounded by this option.
+    ///
+    /// In a connection URL, `socket-timeout` is a positive number of seconds,
+    /// which may include a fractional part.
+    ///
+    /// This option does not make externally cancelled queries safe to reuse.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timeout` is zero. Use `None` to disable the timeout.
+    pub fn socket_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        let timeout = timeout.into();
+        assert!(
+            timeout.is_none_or(|timeout| !timeout.is_zero()),
+            "socket_timeout must be greater than zero; use None to disable it"
+        );
+        self.socket_timeout = timeout;
+        self
+    }
+
+    /// Get the configured socket inactivity timeout, or `None` if unbounded.
+    pub fn get_socket_timeout(&self) -> Option<Duration> {
+        self.socket_timeout
     }
 
     /// Sets the capacity of the connection's statement cache in a number of stored
