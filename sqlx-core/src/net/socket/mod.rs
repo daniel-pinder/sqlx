@@ -41,6 +41,35 @@ pub trait Socket: Send + Sync + Unpin + 'static {
     /// inheriting a silent default.
     fn last_transport_progress(&self) -> Option<std::time::Instant>;
 
+    /// When this socket last RECEIVED a byte, `None` before the first one.
+    ///
+    /// This is the ARMING signal: only a received byte can establish that an
+    /// incoming message has started arriving. A write moves
+    /// [`Self::last_transport_progress`] — and so may extend a wait's
+    /// deadline — but says nothing about the peer, so it must not arm one.
+    ///
+    /// REQUIRED on purpose, like [`Self::last_transport_progress`].
+    fn last_receive_progress(&self) -> Option<std::time::Instant>;
+
+    /// Whether this transport is holding a PREFIX OF AN INCOMPLETE incoming
+    /// record that it has already consumed from the wire.
+    ///
+    /// A TLS session buffers ciphertext, so a read can complete with the
+    /// SQLx plaintext buffer empty while the first half of the NEXT record
+    /// already sits in the session. That is an incoming message in flight and
+    /// must arm the inactivity bound; without this predicate the entry
+    /// window — bytes pulled by the previous read — is invisible. Plaintext
+    /// transports do not frame records and answer `false`.
+    ///
+    /// The predicate is deliberately CONSERVATIVE: an unfinished record can be
+    /// shown unfinished, but not shown to carry application data (TLS 1.3
+    /// ciphertext may decode to control traffic), so it arms the bound rather
+    /// than claiming a message exists.
+    ///
+    /// REQUIRED on purpose: a new transport has to make that decision instead
+    /// of inheriting a silent "nothing buffered".
+    fn has_incomplete_incoming_record(&self) -> bool;
+
     fn read<'a, B: ReadBuf>(&'a mut self, buf: &'a mut B) -> Read<'a, Self, B>
     where
         Self: Sized,
@@ -195,6 +224,14 @@ impl<S: Socket + ?Sized> Socket for Box<S> {
 
     fn last_transport_progress(&self) -> Option<std::time::Instant> {
         (**self).last_transport_progress()
+    }
+
+    fn last_receive_progress(&self) -> Option<std::time::Instant> {
+        (**self).last_receive_progress()
+    }
+
+    fn has_incomplete_incoming_record(&self) -> bool {
+        (**self).has_incomplete_incoming_record()
     }
 }
 

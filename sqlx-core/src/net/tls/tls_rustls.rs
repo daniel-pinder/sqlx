@@ -76,6 +76,16 @@ impl<S: Socket> Socket for RustlsSocket<S> {
         self.inner.last_transport_progress()
     }
 
+    fn last_receive_progress(&self) -> Option<std::time::Instant> {
+        self.inner.last_receive_progress()
+    }
+
+    fn has_incomplete_incoming_record(&self) -> bool {
+        // rustls holds the first half of a record internally after a read
+        // completes; without this the next idle wait cannot see it.
+        self.inner.has_incomplete_incoming_record()
+    }
+
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.close_notify_sent {
             self.state.send_close_notify();

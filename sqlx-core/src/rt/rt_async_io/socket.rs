@@ -15,11 +15,17 @@ use crate::io::ReadBuf;
 pub struct TrackedTcpStream {
     inner: Async<TcpStream>,
     last: Option<Instant>,
+    /// When a byte was last RECEIVED (never written).
+    last_received: Option<Instant>,
 }
 
 impl TrackedTcpStream {
     pub fn new(inner: Async<TcpStream>) -> Self {
-        Self { inner, last: None }
+        Self {
+            inner,
+            last: None,
+            last_received: None,
+        }
     }
 }
 
@@ -27,7 +33,9 @@ impl Socket for TrackedTcpStream {
     fn try_read(&mut self, buf: &mut dyn ReadBuf) -> io::Result<usize> {
         let read = self.inner.get_ref().read(buf.init_mut())?;
         if read > 0 {
-            self.last = Some(Instant::now());
+            let now = Instant::now();
+            self.last = Some(now);
+            self.last_received = Some(now);
         }
         Ok(read)
     }
@@ -54,6 +62,15 @@ impl Socket for TrackedTcpStream {
 
     fn last_transport_progress(&self) -> Option<Instant> {
         self.last
+    }
+
+    fn last_receive_progress(&self) -> Option<Instant> {
+        self.last_received
+    }
+
+    fn has_incomplete_incoming_record(&self) -> bool {
+        // A plaintext transport has no record framing to be part-way through.
+        false
     }
 }
 
@@ -63,12 +80,18 @@ impl Socket for TrackedTcpStream {
 pub struct TrackedUnixStream {
     inner: Async<std::os::unix::net::UnixStream>,
     last: Option<Instant>,
+    /// When a byte was last RECEIVED (never written).
+    last_received: Option<Instant>,
 }
 
 #[cfg(unix)]
 impl TrackedUnixStream {
     pub fn new(inner: Async<std::os::unix::net::UnixStream>) -> Self {
-        Self { inner, last: None }
+        Self {
+            inner,
+            last: None,
+            last_received: None,
+        }
     }
 }
 
@@ -77,7 +100,9 @@ impl Socket for TrackedUnixStream {
     fn try_read(&mut self, buf: &mut dyn ReadBuf) -> io::Result<usize> {
         let read = self.inner.get_ref().read(buf.init_mut())?;
         if read > 0 {
-            self.last = Some(Instant::now());
+            let now = Instant::now();
+            self.last = Some(now);
+            self.last_received = Some(now);
         }
         Ok(read)
     }
@@ -104,5 +129,14 @@ impl Socket for TrackedUnixStream {
 
     fn last_transport_progress(&self) -> Option<Instant> {
         self.last
+    }
+
+    fn last_receive_progress(&self) -> Option<Instant> {
+        self.last_received
+    }
+
+    fn has_incomplete_incoming_record(&self) -> bool {
+        // A plaintext transport has no record framing to be part-way through.
+        false
     }
 }
