@@ -775,6 +775,45 @@ mod tls_progress {
         server.join().unwrap();
     }
 
+    /// A message that spans TWO TLS records — record 1 delivers the frame
+    /// header, record 2 never arrives — must time out on an idle listener.
+    /// The bound arms on the first byte of the MESSAGE that the session
+    /// delivered (partial plaintext), not only on ciphertext it has buffered:
+    /// the single-record witness above covers "no plaintext yet", this one
+    /// covers "some plaintext, rest missing".
+    #[test]
+    fn partial_message_across_two_tls_records_times_out_on_an_idle_listener() {
+        let (options, server) = listener(|mut peer| {
+            peer.startup();
+            assert_eq!(peer.read_frame().0, b'Q'); // LISTEN
+            peer.write_plain(&[message(b'C', b"LISTEN\0"), message(b'Z', b"I")].concat());
+
+            // Record 1 carries only the 5-byte header of a notification; the
+            // record with its body is never sent.
+            let notification = message(b'A', &[0, 0, 0, 8, b'c', b'h', b'a', b'n', 0]);
+            let wire = peer.seal(&notification[..5]);
+            let mut tcp = peer.tcp();
+            tcp.write_all(&wire).unwrap();
+            tcp.flush().unwrap();
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        test_block_on(async {
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(WATCHDOG)
+                .connect_lazy_with(options);
+            let mut listener = PgListener::connect_with(&pool).await.unwrap();
+            listener.listen("chan").await.unwrap();
+            let error = timeout(WATCHDOG, listener.try_recv())
+                .await
+                .expect("a message that started arriving must arm the bound")
+                .expect_err("the incomplete message must not be deliverable");
+            assert_timeout(error);
+        });
+        server.join().unwrap();
+    }
+
     /// The other half of S2: an idle listener with NO transport activity at all
     /// must keep waiting — the bound arms on the first byte, it does not fire
     /// on a quiet connection.
