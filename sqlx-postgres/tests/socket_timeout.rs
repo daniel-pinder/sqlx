@@ -874,17 +874,23 @@ mod tls_progress {
         Ok(ControlFlow::Continue(buf.len() + 1))
     }
 
+    /// What [`prefetch_peer`] hands back: the port (read only once the
+    /// listener is bound, never before), the channel carrying the response
+    /// record's wire length for the precondition assertion, the stop channel
+    /// the test uses to release the peer thread, and that thread's handle.
+    type PrefetchPeer = (
+        u16,
+        std::sync::mpsc::Receiver<(usize, usize)>,
+        std::sync::mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    );
+
     /// Script a peer that answers LISTEN, then sends the response record and
     /// the first half of the next record AS ONE WRITE, and keeps the
     /// connection OPEN and SILENT — no second half, no EOF, so a reconnect
     /// path is unreachable. The response record's wire length arrives on the
     /// channel for the precondition assertion.
-    fn prefetch_peer() -> (
-        u16,
-        std::sync::mpsc::Receiver<(usize, usize)>,
-        std::sync::mpsc::Sender<()>,
-        thread::JoinHandle<()>,
-    ) {
+    fn prefetch_peer() -> PrefetchPeer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = std::sync::mpsc::channel();
