@@ -4491,6 +4491,7 @@ dependencies = [
  "num-bigint",
  "rand 0.10.3",
  "rust_decimal",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",

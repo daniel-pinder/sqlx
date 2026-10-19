@@ -8,6 +8,11 @@ pub struct StdSocket<S> {
     pub socket: S,
     wants_read: bool,
     wants_write: bool,
+    /// When ciphertext was last read from or written to `socket`. This is the
+    /// transport-progress signal the inactivity bound is anchored to: a TLS
+    /// record arriving in fragments moves this instant while the plaintext
+    /// buffer stays empty.
+    last_transport_progress: Option<std::time::Instant>,
 }
 
 impl<S: Socket> StdSocket<S> {
@@ -16,6 +21,7 @@ impl<S: Socket> StdSocket<S> {
             socket,
             wants_read: false,
             wants_write: false,
+            last_transport_progress: None,
         }
     }
 
@@ -51,6 +57,11 @@ impl<S: Socket> StdSocket<S> {
     pub async fn ready(&mut self) -> io::Result<()> {
         future::poll_fn(|cx| self.poll_ready(cx)).await
     }
+
+    /// When ciphertext was last moved, if ever.
+    pub fn last_transport_progress(&self) -> Option<std::time::Instant> {
+        self.last_transport_progress
+    }
 }
 
 impl<S: Socket> Read for StdSocket<S> {
@@ -58,6 +69,9 @@ impl<S: Socket> Read for StdSocket<S> {
         self.wants_read = true;
         let read = self.socket.try_read(&mut buf)?;
         self.wants_read = false;
+        if read > 0 {
+            self.last_transport_progress = Some(std::time::Instant::now());
+        }
 
         Ok(read)
     }
@@ -68,6 +82,9 @@ impl<S: Socket> Write for StdSocket<S> {
         self.wants_write = true;
         let written = self.socket.try_write(buf)?;
         self.wants_write = false;
+        if written > 0 {
+            self.last_transport_progress = Some(std::time::Instant::now());
+        }
         Ok(written)
     }
 

@@ -21,6 +21,10 @@ pub struct BufferedSocket<S> {
     io_timeout: Option<Duration>,
     poisoned: Option<Duration>,
     socket_id: usize,
+    /// Instant of the transport progress observed at the last completed read;
+    /// the idle read path arms its bound as soon as this is stale (see
+    /// `ReadBuffer::read`).
+    seen_transport_progress: Option<std::time::Instant>,
 }
 
 pub struct WriteBuffer {
@@ -44,6 +48,7 @@ impl<S: Socket> BufferedSocket<S> {
             io_timeout: None,
             poisoned: None,
             socket_id: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+            seen_transport_progress: None,
             write_buf: WriteBuffer {
                 buf: Vec::with_capacity(DEFAULT_BUF_SIZE),
                 bytes_written: 0,
@@ -75,13 +80,10 @@ impl<S: Socket> BufferedSocket<S> {
     }
 
     fn poison_on_timeout(&mut self, error: io::Error) -> io::Error {
-        if let Some(timeout) = error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<SocketTimedOut>())
-        {
+        if let Some(after) = socket_timed_out(&error) {
             if self.poisoned.is_none() {
-                self.poisoned = Some(timeout.after);
-                tracing::warn!(target: "sqlx::net::timeout", timeout = ?timeout.after,
+                self.poisoned = Some(after);
+                tracing::warn!(target: "sqlx::net::timeout", timeout = ?after,
                     socket_id = self.socket_id, "socket I/O timed out; connection poisoned");
             }
         }
@@ -139,7 +141,13 @@ impl<S: Socket> BufferedSocket<S> {
 
             if let Err(error) = self
                 .read_buf
-                .read(read_len, &mut self.socket, self.io_timeout, idle)
+                .read(
+                    read_len,
+                    &mut self.socket,
+                    self.io_timeout,
+                    idle,
+                    &mut self.seen_transport_progress,
+                )
                 .await
             {
                 return Err(self.poison_on_timeout(error).into());
@@ -192,28 +200,81 @@ impl<S: Socket> BufferedSocket<S> {
     pub async fn flush(&mut self) -> io::Result<()> {
         self.check_poisoned()?;
         while !self.write_buf.is_empty() {
-            let written = io_timeout(self.io_timeout, async {
-                self.socket.write(self.write_buf.get()).await
-            })
-            .await
-            .map_err(|error| self.poison_on_timeout(error))?;
+            let mut anchor = std::time::Instant::now();
+            let written = loop {
+                let before = self.socket.last_transport_progress();
+                let window = self
+                    .io_timeout
+                    .map(|bound| bound.saturating_sub(anchor.elapsed()));
+                match io_timeout_bound(window, self.io_timeout, async {
+                    self.socket.write(self.write_buf.get()).await
+                })
+                .await
+                {
+                    Ok(written) => break written,
+                    Err(error) if socket_timed_out(&error).is_some() => {
+                        match self.socket.last_transport_progress() {
+                            // The transport moved bytes while the wait had no
+                            // plaintext progress to report (a TLS record being
+                            // re-assembled or a partly accepted write): the
+                            // deadline re-anchors to that byte, exactly as
+                            // SO_SNDTIMEO would.
+                            Some(last) if Some(last) != before => anchor = last,
+                            _ => return Err(self.poison_on_timeout(error)),
+                        }
+                    }
+                    Err(error) => return Err(self.poison_on_timeout(error)),
+                }
+            };
             self.write_buf.consume(written);
             self.write_buf.sanity_check();
         }
 
-        io_timeout(self.io_timeout, async { self.socket.flush().await })
-            .await
-            .map_err(|error| self.poison_on_timeout(error))?;
-
-        Ok(())
+        let mut anchor = std::time::Instant::now();
+        loop {
+            let before = self.socket.last_transport_progress();
+            let window = self
+                .io_timeout
+                .map(|bound| bound.saturating_sub(anchor.elapsed()));
+            match io_timeout_bound(window, self.io_timeout, async { self.socket.flush().await })
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if socket_timed_out(&error).is_some() => {
+                    match self.socket.last_transport_progress() {
+                        Some(last) if Some(last) != before => anchor = last,
+                        _ => return Err(self.poison_on_timeout(error)),
+                    }
+                }
+                Err(error) => return Err(self.poison_on_timeout(error)),
+            }
+        }
     }
 
     pub async fn shutdown(&mut self) -> io::Result<()> {
         self.check_poisoned()?;
         self.flush().await?;
-        io_timeout(self.io_timeout, async { self.socket.shutdown().await })
+        let mut anchor = std::time::Instant::now();
+        loop {
+            let before = self.socket.last_transport_progress();
+            let window = self
+                .io_timeout
+                .map(|bound| bound.saturating_sub(anchor.elapsed()));
+            match io_timeout_bound(window, self.io_timeout, async {
+                self.socket.shutdown().await
+            })
             .await
-            .map_err(|error| self.poison_on_timeout(error))
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if socket_timed_out(&error).is_some() => {
+                    match self.socket.last_transport_progress() {
+                        Some(last) if Some(last) != before => anchor = last,
+                        _ => return Err(self.poison_on_timeout(error)),
+                    }
+                }
+                Err(error) => return Err(self.poison_on_timeout(error)),
+            }
+        }
     }
 
     pub fn shrink_buffers(&mut self) {
@@ -234,6 +295,7 @@ impl<S: Socket> BufferedSocket<S> {
             io_timeout: self.io_timeout,
             poisoned: self.poisoned,
             socket_id: self.socket_id,
+            seen_transport_progress: self.seen_transport_progress,
         }
     }
 }
@@ -361,19 +423,62 @@ impl ReadBuffer {
         socket: &mut impl Socket,
         timeout: Option<Duration>,
         idle: bool,
+        seen_transport_progress: &mut Option<std::time::Instant>,
     ) -> io::Result<()> {
+        // `try_read_idle` exempts a wait that has seen NO progress at all an
+        // idle connection may wait indefinitely for its first byte. Partial
+        // PLAINTEXT (a message header already in the buffer) and partial
+        // TRANSPORT data (a TLS record the session has consumed but not
+        // assembled) both arm the bound, so neither a half-delivered message
+        // nor a half-delivered record can stall the wait forever.
+        let mut armed =
+            !self.read.is_empty() || socket.last_transport_progress() != *seen_transport_progress;
+        // The deadline is anchored to the LAST transport byte (`last + bound`),
+        // never to the start of a fresh window: a byte that arrives just
+        // before a window expires buys one bound from ITS instant, so silence
+        // cannot stretch to twice the bound.
+        let mut anchor = std::time::Instant::now();
         // Because of how `BytesMut` works, we should only be shifting capacity back and forth
         // between `read` and `available` unless we have to read an oversize message.
         while self.read.len() < len {
             self.reserve(len - self.read.len());
 
-            let timeout = if idle && self.read.is_empty() {
-                None
-            } else {
-                timeout
+            let before = socket.last_transport_progress();
+            let window = timeout.map(|bound| bound.saturating_sub(anchor.elapsed()));
+            let read = match io_timeout_bound(window, timeout, async {
+                socket.read(&mut self.available).await
+            })
+            .await
+            {
+                Ok(read) => read,
+                Err(error) if socket_timed_out(&error).is_some() => {
+                    match socket.last_transport_progress() {
+                        Some(last) if Some(last) != before => {
+                            // Ciphertext moved while plaintext did not:
+                            // the message is still arriving (a fragmented
+                            // TLS record, for instance), so the deadline
+                            // re-anchors to that byte instead of poisoning.
+                            armed = true;
+                            anchor = last;
+                            continue;
+                        }
+                        _ if idle && !armed => {
+                            // Genuinely idle: no transport activity yet,
+                            // so the wait goes on rather than failing.
+                            anchor = std::time::Instant::now();
+                            continue;
+                        }
+                        _ => {
+                            *seen_transport_progress = socket.last_transport_progress();
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    *seen_transport_progress = socket.last_transport_progress();
+                    return Err(error);
+                }
             };
-            let read =
-                io_timeout(timeout, async { socket.read(&mut self.available).await }).await?;
 
             if read == 0 {
                 return Err(io::Error::new(
@@ -386,9 +491,15 @@ impl ReadBuffer {
                 ));
             }
 
+            // Plaintext progress is progress: the next wait gets a full bound
+            // measured from it, exactly as it did before the bound followed
+            // the transport.
+            armed = true;
+            anchor = std::time::Instant::now();
             self.advance(read);
         }
 
+        *seen_transport_progress = socket.last_transport_progress();
         Ok(())
     }
 
@@ -420,17 +531,38 @@ impl ReadBuffer {
     }
 }
 
+/// The configured bound carried by a timed-out wait, or `None` for any other
+/// error. The payload is how the bound survives the TLS layer: it is built
+/// below it and inspected here.
+fn socket_timed_out(error: &io::Error) -> Option<Duration> {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<SocketTimedOut>())
+        .map(|timeout| timeout.after)
+}
+
 // Apply the bound to one wait, not a whole message: successful partial I/O resets it.
+// `window` may be shorter than `after` when the deadline is anchored to the
+// last transport byte; the error still reports the CONFIGURED bound, which is
+// what the connection is poisoned for and what the log names.
 // Callers keep raw Socket futures inside async blocks to preserve Send when
 // this is nested in driver futures with a boxed socket.
-async fn io_timeout<T: Send>(
-    timeout: Option<Duration>,
+/// Apply the bound to one wait. `window` is the wait actually armed and
+/// `bound` is the configured bound the error reports.
+async fn io_timeout_bound<T: Send>(
+    window: Option<Duration>,
+    bound: Option<Duration>,
     io: impl Future<Output = io::Result<T>> + Send,
 ) -> io::Result<T> {
-    match timeout {
-        Some(after) => crate::rt::timeout(after, io)
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, SocketTimedOut { after }))?,
+    match window {
+        Some(window) => crate::rt::timeout(window, io).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                SocketTimedOut {
+                    after: bound.unwrap_or(window),
+                },
+            )
+        })?,
         None => io.await,
     }
 }

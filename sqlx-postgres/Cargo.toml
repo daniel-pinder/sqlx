@@ -78,6 +78,10 @@ workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# The TLS socket witnesses build a scripted rustls SERVER on a loopback socket
+# (fragmented ciphertext and partial records); the client side is the facade's
+# `tls-rustls-ring` dev-dependency below. Same version, same provider.
+rustls = { version = "0.23.24", default-features = false, features = ["std", "ring"] }
 
 [dev-dependencies.sqlx]
 # FIXME: https://github.com/rust-lang/cargo/issues/15622

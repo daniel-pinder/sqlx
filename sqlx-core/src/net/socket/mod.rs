@@ -28,6 +28,24 @@ pub trait Socket: Send + Sync + Unpin + 'static {
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 
+    /// When the TRANSPORT below this socket last moved a byte, if this socket
+    /// wraps one.
+    ///
+    /// [`BufferedSocket`] uses it to tell a fragmented message in flight from
+    /// a stalled peer and to keep its bound exact: the deadline is anchored to
+    /// this instant (`last + bound`), so a record that starts arriving just
+    /// before a window expires is not granted a second full window. That is
+    /// the `SO_RCVTIMEO`/`SO_SNDTIMEO` rule, applied to the layer that
+    /// actually moves ciphertext rather than to the plaintext a TLS session
+    /// exposes.
+    ///
+    /// A plain socket IS the transport, so its own waits already observe
+    /// progress directly and the default (no report, so no restart) keeps its
+    /// behaviour unchanged.
+    fn last_transport_progress(&self) -> Option<std::time::Instant> {
+        None
+    }
+
     fn read<'a, B: ReadBuf>(&'a mut self, buf: &'a mut B) -> Read<'a, Self, B>
     where
         Self: Sized,
@@ -178,6 +196,10 @@ impl<S: Socket + ?Sized> Socket for Box<S> {
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         (**self).poll_shutdown(cx)
+    }
+
+    fn last_transport_progress(&self) -> Option<std::time::Instant> {
+        (**self).last_transport_progress()
     }
 }
 
