@@ -815,8 +815,6 @@ mod tls_progress {
         /// Raw bytes read through the LISTEN response — plus anything the
         /// same reads pulled with it.
         after_listen: usize,
-        /// Instant of the last raw read during the LISTEN exchange.
-        last_read: Option<Instant>,
     }
 
     /// Connect over TLS and complete the startup + LISTEN exchange, leaving
@@ -863,7 +861,6 @@ mod tls_progress {
             socket,
             after_startup,
             after_listen: reads.bytes(),
-            last_read: reads.last(),
         }
     }
 
@@ -884,7 +881,7 @@ mod tls_progress {
     /// channel for the precondition assertion.
     fn prefetch_peer() -> (
         u16,
-        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Receiver<(usize, usize)>,
         std::sync::mpsc::Sender<()>,
         thread::JoinHandle<()>,
     ) {
@@ -909,7 +906,8 @@ mod tls_progress {
                 "one write must carry the response record and the prefix"
             );
             tcp.flush().unwrap();
-            tx.send(record_a).unwrap();
+            // (the response record on its own, the whole single write)
+            tx.send((record_a, one_write.len())).unwrap();
             // Hold the socket open and silent: no second half, no EOF.
             let _ = stopped.recv_timeout(Duration::from_secs(10));
         });
@@ -1156,8 +1154,8 @@ mod tls_progress {
                 listener.listen("chan").await.unwrap();
                 listener.eager_reconnect(false);
 
-                let record_a = record_a.recv_timeout(WATCHDOG).expect("server length");
-                assert!(record_a > 0);
+                let (record_a, wire_len) = record_a.recv_timeout(WATCHDOG).expect("server lengths");
+                assert!(record_a > 0 && wire_len > record_a);
 
                 let started = Instant::now();
                 let waited = timeout(WATCHDOG, listener.try_recv())
@@ -1191,50 +1189,73 @@ mod tls_progress {
         server.join().unwrap();
     }
 
-    /// The same prefetched prefix, asserted on the raw socket: the read that
-    /// COMPLETES the LISTEN exchange also pulls the first half of the next
-    /// record, and the idle wait that follows must fire at ONE bound measured
-    /// from the RECEIVED BYTE — the original anchor, not a fresh one from the
-    /// wait's entry. This is the witness old code fails by hanging: nothing
-    /// moves during the wait, so there is nothing for a progress-only rule to
-    /// see.
+    /// What the bootstrap's reads pulled beyond the LISTEN response record.
+    /// A read-ahead backend (rustls) pulls the next record's prefix; a
+    /// record-at-a-time backend (OpenSSL under native-tls) stops at the
+    /// record boundary and the prefix arrives during the idle wait instead.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EntryWindow {
+        Prefetched,
+        NotPrefetched,
+    }
+
+    fn classify_entry_window(boot: &Bootstrapped, record_a: usize, wire_len: usize) -> EntryWindow {
+        let pulled = boot.after_listen - boot.after_startup;
+        if pulled > record_a {
+            assert_eq!(
+                pulled, wire_len,
+                "a read-ahead backend pulls the whole single write"
+            );
+            EntryWindow::Prefetched
+        } else {
+            assert_eq!(
+                pulled, record_a,
+                "a record-at-a-time backend stops exactly at the response record's boundary"
+            );
+            EntryWindow::NotPrefetched
+        }
+    }
+
+    /// The entry window, asserted on the raw socket: the read that COMPLETES
+    /// the LISTEN exchange may also pull the first half of the NEXT record,
+    /// and the idle wait that follows has empty plaintext and no NEW transport
+    /// progress since that read. The bound must fire at ONE bound measured
+    /// from the LAST RECEIVED BYTE — the original anchor, not a fresh one from
+    /// the wait's entry. On old code the prefetched byte is invisible and the
+    /// wait runs into the outer watchdog; a record-at-a-time backend delivers
+    /// the prefix during the wait and the transport-progress rule bounds it,
+    /// which the same assertion pins.
     #[test]
-    fn a_record_prefetched_by_the_previous_read_bounds_the_next_idle_wait() {
-        let (port, record_a, stop, server) = prefetch_peer();
+    fn a_record_at_the_entry_window_bounds_the_next_idle_wait() {
+        let (port, lengths, stop, server) = prefetch_peer();
         let reads = Arc::new(RawReads::default());
 
         test_block_on(async {
             let boot = timeout(WATCHDOG, bootstrap(port, reads.clone()))
                 .await
                 .expect("bootstrap must complete");
-            let record_a = record_a.recv_timeout(WATCHDOG).expect("server length");
-            assert!(
-                boot.after_listen - boot.after_startup > record_a,
-                "precondition: the next record's prefix must already have crossed the \
-                 client's raw-read boundary (read {} ciphertext bytes after startup; \
-                 the response record alone is {record_a})",
-                boot.after_listen - boot.after_startup,
-            );
+            let (record_a, wire_len) = lengths.recv_timeout(WATCHDOG).expect("server lengths");
+            let window = classify_entry_window(&boot, record_a, wire_len);
 
-            let anchor = boot.last_read.expect("the prefix read must be recorded");
             let mut socket = boot.socket;
             socket.set_io_timeout(Some(BOUND));
 
             let error = timeout(WATCHDOG, socket.try_read_idle(wait_for_a_byte))
                 .await
-                .expect("the prefetched prefix must arm the bound")
+                .expect("a record in flight must arm the bound")
                 .unwrap_err();
             let fired_at = Instant::now();
             assert_timeout(error);
 
-            let from_anchor = fired_at.duration_since(anchor);
+            let last_byte = reads.last().expect("a received byte must be recorded");
+            let from_byte = fired_at.duration_since(last_byte);
             assert!(
-                from_anchor >= BOUND,
-                "the wait fired before the received byte's bound: {from_anchor:?}"
+                from_byte >= BOUND,
+                "the wait fired before the received byte's bound ({window:?}): {from_byte:?}"
             );
             assert!(
-                from_anchor < BOUND + Duration::from_millis(500),
-                "the deadline was renewed past the original anchor: {from_anchor:?}"
+                from_byte < BOUND + Duration::from_millis(500),
+                "the deadline was renewed past the received byte ({window:?}): {from_byte:?}"
             );
 
             // The poison is permanent: the next wait fails immediately with
@@ -1251,28 +1272,25 @@ mod tls_progress {
         server.join().unwrap();
     }
 
-    /// The prefetched prefix with a DELAYED entry: the wait starts half a
-    /// bound after the byte arrived. The deadline must still fall at the
-    /// received byte's bound, not restart from the delayed entry — a renewed
-    /// full bound would let a dead peer hold the connection for up to two
-    /// bounds.
+    /// The same record, with a DELAYED entry: the wait starts half a bound
+    /// after the response. When the prefix was already pulled, the deadline
+    /// must still fall at ITS byte's bound, not restart from the entry (a
+    /// renewed full bound would let a dead peer hold the connection for up to
+    /// two bounds). A record-at-a-time backend has no earlier byte to renew:
+    /// the prefix arrives at the entry, so exactly one bound from there is the
+    /// correct answer and the assertion says so.
     #[test]
     fn a_delayed_idle_wait_is_not_granted_a_fresh_bound() {
-        let (port, record_a, stop, server) = prefetch_peer();
+        let (port, lengths, stop, server) = prefetch_peer();
         let reads = Arc::new(RawReads::default());
 
         test_block_on(async {
             let boot = timeout(WATCHDOG, bootstrap(port, reads.clone()))
                 .await
                 .expect("bootstrap must complete");
-            let record_a = record_a.recv_timeout(WATCHDOG).expect("server length");
-            assert!(
-                boot.after_listen - boot.after_startup > record_a,
-                "precondition: the next record's prefix must already have crossed the \
-                 client's raw-read boundary"
-            );
+            let (record_a, wire_len) = lengths.recv_timeout(WATCHDOG).expect("server lengths");
+            let window = classify_entry_window(&boot, record_a, wire_len);
 
-            let anchor = boot.last_read.expect("the prefix read must be recorded");
             let mut socket = boot.socket;
             socket.set_io_timeout(Some(BOUND));
 
@@ -1282,18 +1300,32 @@ mod tls_progress {
             let started = Instant::now();
             let error = timeout(WATCHDOG, socket.try_read_idle(wait_for_a_byte))
                 .await
-                .expect("the prefetched prefix must arm the bound")
+                .expect("a record in flight must arm the bound")
                 .unwrap_err();
             let elapsed = started.elapsed();
+            let fired_at = Instant::now();
             assert_timeout(error);
+
+            let last_byte = reads.last().expect("a received byte must be recorded");
+            let from_byte = fired_at.duration_since(last_byte);
             assert!(
-                elapsed < BOUND * 3 / 4,
-                "the delayed entry was granted a fresh bound: waited {elapsed:?}"
+                from_byte >= BOUND,
+                "the deadline fell before the received byte's bound ({window:?}): {from_byte:?}"
             );
             assert!(
-                Instant::now().duration_since(anchor) >= BOUND,
-                "the deadline must not fall before the received byte's bound"
+                from_byte < BOUND + Duration::from_millis(500),
+                "the deadline was renewed past the received byte ({window:?}): {from_byte:?}"
             );
+            match window {
+                EntryWindow::Prefetched => assert!(
+                    elapsed < BOUND * 3 / 4,
+                    "the delayed entry was granted a fresh bound: waited {elapsed:?}"
+                ),
+                EntryWindow::NotPrefetched => assert!(
+                    elapsed >= BOUND,
+                    "the prefix arrived at the entry; one bound from there: waited {elapsed:?}"
+                ),
+            }
         });
         let _ = stop.send(());
         server.join().unwrap();
