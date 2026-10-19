@@ -269,8 +269,21 @@ pub async fn connect_tcp<Ws: WithSocket>(
 /// If `host` is a hostname, attempt to connect to each address it resolves to.
 ///
 /// This implements the same behavior as [`tokio::net::TcpStream::connect()`].
+///
+/// The return type is CONCRETE on purpose: the caller wraps it in
+/// [`crate::rt::rt_async_io::socket::TrackedTcpStream`], which is what
+/// implements [`Socket`] and records transport progress. Returning
+/// `impl Socket` here compiled only against upstream's blanket impl for
+/// `async_io::Async<TcpStream>`; in the fork that impl is the tracked wrapper,
+/// so an opaque `impl Socket` is neither constructible from the raw stream nor
+/// acceptable to `TrackedTcpStream::new`. Naming the raw type keeps the
+/// wrapping — and therefore the progress semantics — identical on both
+/// runtime arms.
 #[cfg(feature = "_rt-async-io")]
-async fn connect_tcp_async_io(host: &str, port: u16) -> crate::Result<impl Socket> {
+async fn connect_tcp_async_io(
+    host: &str,
+    port: u16,
+) -> crate::Result<async_io::Async<std::net::TcpStream>> {
     use async_io::Async;
     use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 
