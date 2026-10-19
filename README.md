@@ -4,7 +4,7 @@ A **bridge fork** of [sqlx](https://github.com/launchbadge/sqlx) carrying
 one patch, until upstream ships it.
 
 - **Base:** upstream `v0.9.0` — `75bc0487eb661da811bb7a3c5d158f1bd463fef4`.
-- **The patch:** one commit on top, upstreamable as-is. It bounds two
+- **The patch:** one commit on top, upstreamable as-is. It bounds three
   waits in `sqlx-core`'s pool that a wedged backend could otherwise park
   forever:
   - the on-release ping — `RELEASE_PING_TIMEOUT` (5 s, matching the
@@ -14,10 +14,16 @@ one patch, until upstream ships it.
   - the `PoolInner::close()` join — `CLOSE_JOIN_TIMEOUT` (5 s); on expiry
     the join is abandoned and the idle drain proceeds on one shared
     deadline, with the abandoned-join accounting saturating so
-    `Pool::size()` cannot wrap.
-- **Why a fork:** neither wait is boundable by configuration (measured in
-  FibreTel's `billing-1e0j` diagnosis), and with every permit wedged,
-  `acquire` fails `PoolTimedOut` for the life of the process.
+    `Pool::size()` cannot wrap;
+  - the idle-connection liveness ping before a checkout — `ACQUIRE_PING_TIMEOUT`
+    (5 s); on expiry the connection is discarded without an awaited close
+    (the same synchronous-drop rule as the on-release ping), and the size
+    guard is handed back so the acquire opens a fresh connection in the
+    freed slot.
+- **Why a fork:** none of the waits is boundable by configuration (measured
+  in FibreTel's `billing-1e0j` diagnosis, extended by its `messaging-v6m`
+  follow-up), and with every permit wedged, `acquire` fails `PoolTimedOut`
+  for the life of the process.
 
 ## How FibreTel consumes it
 

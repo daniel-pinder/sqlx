@@ -467,6 +467,24 @@ impl<DB: Database> Floating<DB, Idle<DB>> {
         self.guard
     }
 
+    /// Discard this connection without awaiting any close, handing its size
+    /// guard back so the caller can open a replacement in the same slot.
+    ///
+    /// `close_hard().await` ends in `BufferedSocket::shutdown()`, which begins
+    /// with `flush()` on the very write buffer a failed `ping()` could not
+    /// drain: against a peer that ACKs but stops reading that flush parks with
+    /// the permit still held, so awaiting it would only move the hang from the
+    /// ping to the close (the hard-close hole the on-release path documents).
+    /// Dropping the raw connection closes the socket synchronously — there is
+    /// no await to block on — and the guard is returned rather than released so
+    /// the acquire loop can open a fresh connection without losing the slot.
+    pub fn discard(self) -> DecrementSizeGuard<DB> {
+        let Self { inner, guard } = self;
+        drop(inner);
+
+        guard
+    }
+
     pub fn metadata(&self) -> PoolConnectionMetadata {
         // Use a single `now` value for consistency.
         let now = Instant::now();
