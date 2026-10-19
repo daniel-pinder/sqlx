@@ -1,6 +1,7 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
@@ -8,48 +9,103 @@ use tokio::net::TcpStream;
 use crate::io::ReadBuf;
 use crate::net::Socket;
 
-impl Socket for TcpStream {
+/// A tokio `TcpStream` that records the instant of the last byte it moved.
+///
+/// Every transport reports transport progress through [`Socket`], so the
+/// inactivity bound is anchored to real wire activity on EVERY socket — there
+/// is no default an implementation can silently omit.
+pub struct TrackedTcpStream {
+    inner: TcpStream,
+    last: Option<Instant>,
+}
+
+impl TrackedTcpStream {
+    pub fn new(inner: TcpStream) -> Self {
+        Self { inner, last: None }
+    }
+}
+
+impl Socket for TrackedTcpStream {
     fn try_read(&mut self, mut buf: &mut dyn ReadBuf) -> io::Result<usize> {
         // Requires `&mut impl BufMut`
-        self.try_read_buf(&mut buf)
+        let read = self.inner.try_read_buf(&mut buf)?;
+        if read > 0 {
+            self.last = Some(Instant::now());
+        }
+        Ok(read)
     }
 
     fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (*self).try_write(buf)
+        let written = self.inner.try_write(buf)?;
+        if written > 0 {
+            self.last = Some(Instant::now());
+        }
+        Ok(written)
     }
 
     fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        (*self).poll_read_ready(cx)
+        self.inner.poll_read_ready(cx)
     }
 
     fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        (*self).poll_write_ready(cx)
+        self.inner.poll_write_ready(cx)
     }
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self).poll_shutdown(cx)
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn last_transport_progress(&self) -> Option<Instant> {
+        self.last
+    }
+}
+
+/// A tokio `UnixStream` that records the instant of the last byte it moved;
+/// see [`TrackedTcpStream`].
+#[cfg(unix)]
+pub struct TrackedUnixStream {
+    inner: tokio::net::UnixStream,
+    last: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl TrackedUnixStream {
+    pub fn new(inner: tokio::net::UnixStream) -> Self {
+        Self { inner, last: None }
     }
 }
 
 #[cfg(unix)]
-impl Socket for tokio::net::UnixStream {
+impl Socket for TrackedUnixStream {
     fn try_read(&mut self, mut buf: &mut dyn ReadBuf) -> io::Result<usize> {
-        self.try_read_buf(&mut buf)
+        let read = self.inner.try_read_buf(&mut buf)?;
+        if read > 0 {
+            self.last = Some(Instant::now());
+        }
+        Ok(read)
     }
 
     fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (*self).try_write(buf)
+        let written = self.inner.try_write(buf)?;
+        if written > 0 {
+            self.last = Some(Instant::now());
+        }
+        Ok(written)
     }
 
     fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        (*self).poll_read_ready(cx)
+        self.inner.poll_read_ready(cx)
     }
 
     fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        (*self).poll_write_ready(cx)
+        self.inner.poll_write_ready(cx)
     }
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self).poll_shutdown(cx)
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn last_transport_progress(&self) -> Option<Instant> {
+        self.last
     }
 }

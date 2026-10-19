@@ -4,7 +4,7 @@ use bytes::BytesMut;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{cmp, io};
 
 use crate::io::{AsyncRead, AsyncReadExt, ProtocolDecode, ProtocolEncode};
@@ -200,26 +200,24 @@ impl<S: Socket> BufferedSocket<S> {
     pub async fn flush(&mut self) -> io::Result<()> {
         self.check_poisoned()?;
         while !self.write_buf.is_empty() {
-            let mut anchor = std::time::Instant::now();
+            let mut bound =
+                WaitBound::new(self.io_timeout, self.socket.last_transport_progress(), true);
             let written = loop {
                 let before = self.socket.last_transport_progress();
-                let window = self
-                    .io_timeout
-                    .map(|bound| bound.saturating_sub(anchor.elapsed()));
-                match io_timeout_bound(window, self.io_timeout, async {
+                match io_timeout_bound(bound.window(), self.io_timeout, async {
                     self.socket.write(self.write_buf.get()).await
                 })
                 .await
                 {
-                    Ok(written) => break written,
+                    Ok(written) => {
+                        if let Some(last) = self.socket.last_transport_progress() {
+                            bound.progress(last);
+                        }
+                        break written;
+                    }
                     Err(error) if socket_timed_out(&error).is_some() => {
                         match self.socket.last_transport_progress() {
-                            // The transport moved bytes while the wait had no
-                            // plaintext progress to report (a TLS record being
-                            // re-assembled or a partly accepted write): the
-                            // deadline re-anchors to that byte, exactly as
-                            // SO_SNDTIMEO would.
-                            Some(last) if Some(last) != before => anchor = last,
+                            Some(last) if Some(last) != before => bound.progress(last),
                             _ => return Err(self.poison_on_timeout(error)),
                         }
                     }
@@ -230,19 +228,19 @@ impl<S: Socket> BufferedSocket<S> {
             self.write_buf.sanity_check();
         }
 
-        let mut anchor = std::time::Instant::now();
+        let mut bound =
+            WaitBound::new(self.io_timeout, self.socket.last_transport_progress(), true);
         loop {
             let before = self.socket.last_transport_progress();
-            let window = self
-                .io_timeout
-                .map(|bound| bound.saturating_sub(anchor.elapsed()));
-            match io_timeout_bound(window, self.io_timeout, async { self.socket.flush().await })
-                .await
+            match io_timeout_bound(bound.window(), self.io_timeout, async {
+                self.socket.flush().await
+            })
+            .await
             {
                 Ok(()) => return Ok(()),
                 Err(error) if socket_timed_out(&error).is_some() => {
                     match self.socket.last_transport_progress() {
-                        Some(last) if Some(last) != before => anchor = last,
+                        Some(last) if Some(last) != before => bound.progress(last),
                         _ => return Err(self.poison_on_timeout(error)),
                     }
                 }
@@ -254,13 +252,11 @@ impl<S: Socket> BufferedSocket<S> {
     pub async fn shutdown(&mut self) -> io::Result<()> {
         self.check_poisoned()?;
         self.flush().await?;
-        let mut anchor = std::time::Instant::now();
+        let mut bound =
+            WaitBound::new(self.io_timeout, self.socket.last_transport_progress(), true);
         loop {
             let before = self.socket.last_transport_progress();
-            let window = self
-                .io_timeout
-                .map(|bound| bound.saturating_sub(anchor.elapsed()));
-            match io_timeout_bound(window, self.io_timeout, async {
+            match io_timeout_bound(bound.window(), self.io_timeout, async {
                 self.socket.shutdown().await
             })
             .await
@@ -268,7 +264,7 @@ impl<S: Socket> BufferedSocket<S> {
                 Ok(()) => return Ok(()),
                 Err(error) if socket_timed_out(&error).is_some() => {
                     match self.socket.last_transport_progress() {
-                        Some(last) if Some(last) != before => anchor = last,
+                        Some(last) if Some(last) != before => bound.progress(last),
                         _ => return Err(self.poison_on_timeout(error)),
                     }
                 }
@@ -425,27 +421,25 @@ impl ReadBuffer {
         idle: bool,
         seen_transport_progress: &mut Option<std::time::Instant>,
     ) -> io::Result<()> {
-        // `try_read_idle` exempts a wait that has seen NO progress at all an
-        // idle connection may wait indefinitely for its first byte. Partial
-        // PLAINTEXT (a message header already in the buffer) and partial
-        // TRANSPORT data (a TLS record the session has consumed but not
-        // assembled) both arm the bound, so neither a half-delivered message
-        // nor a half-delivered record can stall the wait forever.
-        let mut armed =
-            !self.read.is_empty() || socket.last_transport_progress() != *seen_transport_progress;
-        // The deadline is anchored to the LAST transport byte (`last + bound`),
-        // never to the start of a fresh window: a byte that arrives just
-        // before a window expires buys one bound from ITS instant, so silence
-        // cannot stretch to twice the bound.
-        let mut anchor = std::time::Instant::now();
+        // `try_read_idle` exempts a wait that has seen NO byte of the current
+        // message: an idle connection may wait indefinitely for its first one.
+        // Partial PLAINTEXT (a message header already in the buffer) and
+        // partial TRANSPORT data (a TLS record the session has consumed but
+        // not assembled) both arm the bound, so neither a half-delivered
+        // message nor a half-delivered record can stall the wait forever.
+        let entry_last = socket.last_transport_progress();
+        let mut bound = WaitBound::new(
+            timeout,
+            entry_last,
+            !self.read.is_empty() || entry_last != *seen_transport_progress,
+        );
         // Because of how `BytesMut` works, we should only be shifting capacity back and forth
         // between `read` and `available` unless we have to read an oversize message.
         while self.read.len() < len {
             self.reserve(len - self.read.len());
 
             let before = socket.last_transport_progress();
-            let window = timeout.map(|bound| bound.saturating_sub(anchor.elapsed()));
-            let read = match io_timeout_bound(window, timeout, async {
+            let read = match io_timeout_bound(bound.window(), timeout, async {
                 socket.read(&mut self.available).await
             })
             .await
@@ -454,18 +448,18 @@ impl ReadBuffer {
                 Err(error) if socket_timed_out(&error).is_some() => {
                     match socket.last_transport_progress() {
                         Some(last) if Some(last) != before => {
-                            // Ciphertext moved while plaintext did not:
-                            // the message is still arriving (a fragmented
-                            // TLS record, for instance), so the deadline
-                            // re-anchors to that byte instead of poisoning.
-                            armed = true;
-                            anchor = last;
+                            // A byte moved on the wire while plaintext did
+                            // not arrive: the message is still being
+                            // delivered (a fragmented TLS record, for
+                            // instance), so the deadline re-anchors to that
+                            // byte instead of poisoning.
+                            bound.progress(last);
                             continue;
                         }
-                        _ if idle && !armed => {
-                            // Genuinely idle: no transport activity yet,
-                            // so the wait goes on rather than failing.
-                            anchor = std::time::Instant::now();
+                        _ if idle && !bound.armed => {
+                            // Genuinely idle: no byte of this message yet, so
+                            // the wait goes on rather than failing.
+                            bound.idle();
                             continue;
                         }
                         _ => {
@@ -491,11 +485,12 @@ impl ReadBuffer {
                 ));
             }
 
-            // Plaintext progress is progress: the next wait gets a full bound
-            // measured from it, exactly as it did before the bound followed
-            // the transport.
-            armed = true;
-            anchor = std::time::Instant::now();
+            // Delivered plaintext is progress too: the next wait is anchored
+            // to the instant this byte was read, exactly as a ciphertext byte
+            // is.
+            if let Some(last) = socket.last_transport_progress() {
+                bound.progress(last);
+            }
             self.advance(read);
         }
 
@@ -528,6 +523,48 @@ impl ReadBuffer {
             // We should be warning the user not to call this often.
             self.available = BytesMut::with_capacity(DEFAULT_BUF_SIZE);
         }
+    }
+}
+
+/// The inactivity bound for one wait, shared by the read, write, flush and
+/// shutdown paths so the rule is identical in every direction.
+///
+/// The deadline is `last transport byte + bound`, recomputed on every loop
+/// iteration: every byte that moves on the wire — a successful partial read or
+/// write as much as a fragmented TLS record — buys one full bound from ITS
+/// instant. A wait that begins after a quiet period is anchored to its own
+/// start, so a fresh operation is never cut short by an old timestamp, and a
+/// wait may restart without a bound only while it is idle and no byte of the
+/// current message has arrived.
+struct WaitBound {
+    bound: Option<Duration>,
+    anchor: Instant,
+    armed: bool,
+}
+
+impl WaitBound {
+    fn new(bound: Option<Duration>, last: Option<Instant>, armed: bool) -> Self {
+        let entry = Instant::now();
+        let anchor = last.map_or(entry, |last| std::cmp::max(last, entry));
+        Self {
+            bound,
+            anchor,
+            armed,
+        }
+    }
+
+    fn window(&self) -> Option<Duration> {
+        self.bound
+            .map(|bound| bound.saturating_sub(self.anchor.elapsed()))
+    }
+
+    fn progress(&mut self, at: Instant) {
+        self.anchor = at;
+        self.armed = true;
+    }
+
+    fn idle(&mut self) {
+        self.anchor = Instant::now();
     }
 }
 
@@ -616,6 +653,10 @@ mod tests {
             } else {
                 panic!("poisoned shutdown must not touch the socket")
             }
+        }
+        fn last_transport_progress(&self) -> Option<std::time::Instant> {
+            // Nothing ever moves on this mock; a wait on it can only time out.
+            None
         }
     }
 

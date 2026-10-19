@@ -19,14 +19,15 @@ two patches, until upstream ships them.
   each socket read, write, flush and shutdown wait, plus a total deadline for
   connection setup. Expiry returns `Io(TimedOut)` carrying `sqlx::error::SocketTimedOut` and permanently poisons
   the connection, so the pool discards it. The default is `None` (unchanged).
-  The bound follows TRANSPORT progress — the last ciphertext byte read or
-  written — so a TLS record arriving in fragments over the bound is not a
-  stall, and a wait that expires after transport progress re-anchors its
-  deadline to that byte (`last + bound`) instead of poisoning. Idle LISTEN
-  waits arm it on the first byte: a connection with no transport activity
-  waits indefinitely, while a record that has started arriving (even
-  partially, under TLS) must complete within the bound. COPY IN's user data
-  source remains unbounded.
+  The bound follows TRANSPORT progress: every transport — plain TCP or UDS as
+  well as TLS — records the instant of the last byte it moved in either
+  direction, and every wait (read, write, flush, shutdown) is anchored to it
+  (`last + bound`, recomputed each iteration). A record or message arriving in
+  fragments is therefore not a stall; only a whole bound with no byte moved
+  poisons. Idle LISTEN waits arm it on the first byte of the message: a
+  connection with no byte at all waits indefinitely, while a message that has
+  started arriving must complete within the bound. COPY IN's user data source
+  remains unbounded.
   This does not add cancellation safety for queries dropped by external deadlines.
   DB-free witnesses live in `sqlx-postgres/tests/socket_timeout.rs` and the buffered
   socket's unit tests; both patched crates are in `.fibretel/fork.toml`'s scope.

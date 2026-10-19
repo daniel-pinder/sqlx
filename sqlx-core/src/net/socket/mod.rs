@@ -28,23 +28,18 @@ pub trait Socket: Send + Sync + Unpin + 'static {
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 
-    /// When the TRANSPORT below this socket last moved a byte, if this socket
-    /// wraps one.
+    /// When this socket last moved a byte in EITHER direction, `None` before
+    /// the first one.
     ///
-    /// [`BufferedSocket`] uses it to tell a fragmented message in flight from
-    /// a stalled peer and to keep its bound exact: the deadline is anchored to
-    /// this instant (`last + bound`), so a record that starts arriving just
-    /// before a window expires is not granted a second full window. That is
-    /// the `SO_RCVTIMEO`/`SO_SNDTIMEO` rule, applied to the layer that
-    /// actually moves ciphertext rather than to the plaintext a TLS session
-    /// exposes.
-    ///
-    /// A plain socket IS the transport, so its own waits already observe
-    /// progress directly and the default (no report, so no restart) keeps its
-    /// behaviour unchanged.
-    fn last_transport_progress(&self) -> Option<std::time::Instant> {
-        None
-    }
+    /// REQUIRED on purpose. [`BufferedSocket`] anchors its inactivity deadline
+    /// to this instant (`last + bound`) and exempts only a wait that has seen
+    /// no byte of the current message; a socket that cannot answer this cannot
+    /// tell a fragmented message in flight from a stalled peer. Every
+    /// transport in the tree — the raw TCP/UDS sockets (which record on
+    /// `try_read`/`try_write`) and the TLS sessions above them — implements
+    /// it, and a new transport has to make that decision instead of
+    /// inheriting a silent default.
+    fn last_transport_progress(&self) -> Option<std::time::Instant>;
 
     fn read<'a, B: ReadBuf>(&'a mut self, buf: &'a mut B) -> Read<'a, Self, B>
     where
@@ -210,14 +205,22 @@ pub async fn connect_tcp<Ws: WithSocket>(
 ) -> crate::Result<Ws::Output> {
     #[cfg(feature = "_rt-tokio")]
     if crate::rt::rt_tokio::available() {
+        use crate::rt::rt_tokio::socket::TrackedTcpStream;
+
         return Ok(with_socket
-            .with_socket(tokio::net::TcpStream::connect((host, port)).await?)
+            .with_socket(TrackedTcpStream::new(
+                tokio::net::TcpStream::connect((host, port)).await?,
+            ))
             .await);
     }
 
     cfg_if! {
         if #[cfg(feature = "_rt-async-io")] {
-            Ok(with_socket.with_socket(connect_tcp_async_io(host, port).await?).await)
+            use crate::rt::rt_async_io::socket::TrackedTcpStream;
+
+            Ok(with_socket
+                .with_socket(TrackedTcpStream::new(connect_tcp_async_io(host, port).await?))
+                .await)
         } else {
             crate::rt::missing_rt((host, port, with_socket))
         }
@@ -282,19 +285,21 @@ pub async fn connect_uds<P: AsRef<Path>, Ws: WithSocket>(
     {
         #[cfg(feature = "_rt-tokio")]
         if crate::rt::rt_tokio::available() {
+            use crate::rt::rt_tokio::socket::TrackedUnixStream;
             use tokio::net::UnixStream;
 
-            let stream = UnixStream::connect(path).await?;
+            let stream = TrackedUnixStream::new(UnixStream::connect(path).await?);
 
             return Ok(with_socket.with_socket(stream).await);
         }
 
         cfg_if! {
             if #[cfg(feature = "_rt-async-io")] {
+                use crate::rt::rt_async_io::socket::TrackedUnixStream;
                 use async_io::Async;
                 use std::os::unix::net::UnixStream;
 
-                let stream = Async::<UnixStream>::connect(path).await?;
+                let stream = TrackedUnixStream::new(Async::<UnixStream>::connect(path).await?);
 
                 Ok(with_socket.with_socket(stream).await)
             } else {
