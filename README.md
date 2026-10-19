@@ -1,10 +1,10 @@
 # sqlx-fibretel
 
 A **bridge fork** of [sqlx](https://github.com/launchbadge/sqlx) carrying
-two patches, until upstream ships them.
+three patches, until upstream ships them.
 
 - **Base:** upstream `v0.9.0` — `75bc0487eb661da811bb7a3c5d158f1bd463fef4`.
-- **Pool bounds:** the first patch, upstreamable as-is, bounds two
+- **Pool bounds:** upstreamable as-is, they bound three
   waits in `sqlx-core`'s pool that a wedged backend could otherwise park
   forever:
   - the on-release ping — `RELEASE_PING_TIMEOUT` (5 s, matching the
@@ -14,7 +14,12 @@ two patches, until upstream ships them.
   - the `PoolInner::close()` join — `CLOSE_JOIN_TIMEOUT` (5 s); on expiry
     the join is abandoned and the idle drain proceeds on one shared
     deadline, with the abandoned-join accounting saturating so
-    `Pool::size()` cannot wrap.
+    `Pool::size()` cannot wrap;
+  - the idle-connection liveness ping before a checkout — `ACQUIRE_PING_TIMEOUT`
+    (5 s); on expiry the connection is discarded without an awaited close
+    (the same synchronous-drop rule as the on-release ping), and the size
+    guard is handed back so the acquire opens a fresh connection in the
+    freed slot.
 - **Socket bounds:** `PgConnectOptions::socket_timeout` optionally bounds
   each socket read, write, flush and shutdown wait, plus a total deadline for
   connection setup. Expiry returns `Io(TimedOut)` carrying `sqlx::error::SocketTimedOut` and permanently poisons
@@ -28,9 +33,10 @@ two patches, until upstream ships them.
   This does not add cancellation safety for queries dropped by external deadlines.
   DB-free witnesses live in `sqlx-postgres/tests/socket_timeout.rs` and the buffered
   socket's unit tests; both patched crates are in `.fibretel/fork.toml`'s scope.
-- **Why a fork:** neither wait is boundable by configuration (measured in
-  FibreTel's `billing-1e0j` diagnosis), and with every permit wedged,
-  `acquire` fails `PoolTimedOut` for the life of the process.
+- **Why a fork:** none of the waits is boundable by configuration (measured
+  in FibreTel's `billing-1e0j` diagnosis, extended by its `messaging-v6m`
+  follow-up), and with every permit wedged, `acquire` fails `PoolTimedOut`
+  for the life of the process.
 
 ## How FibreTel consumes it
 

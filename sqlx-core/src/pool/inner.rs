@@ -36,6 +36,17 @@ use tracing::Level;
 /// `PoolOptions` API for a fork patch. 5s matches `CLOSE_ON_DROP_TIMEOUT`.
 const CLOSE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound on the idle-connection liveness ping `check_idle_conn()` performs
+/// before handing a pooled connection back to a caller.
+///
+/// `Connection::ping()` is an un-timed round trip on the network drivers, so a
+/// server that stopped answering would hold the acquire for its whole
+/// `acquire_timeout` — and, where the acquire loop is not deadline-wrapped,
+/// indefinitely. On expiry the connection is discarded without an awaited
+/// close (see `Floating::discard`) and the slot is reused for a fresh
+/// connection. 5s matches `RELEASE_PING_TIMEOUT` and `CLOSE_ON_DROP_TIMEOUT`.
+const ACQUIRE_PING_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub(crate) struct PoolInner<DB: Database> {
     pub(super) connect_options: RwLock<Arc<<DB::Connection as Connection>::Options>>,
     pub(super) idle_conns: ArrayQueue<Idle<DB>>,
@@ -542,14 +553,32 @@ async fn check_idle_conn<DB: Database>(
     options: &PoolOptions<DB>,
 ) -> Result<Floating<DB, Live<DB>>, DecrementSizeGuard<DB>> {
     if options.test_before_acquire {
-        // Check that the connection is still live
-        if let Err(error) = conn.ping().await {
-            // an error here means the other end has hung up or we lost connectivity
-            // either way we're fine to just discard the connection
-            // the error itself here isn't necessarily unexpected so WARN is too strong
-            tracing::info!(%error, "ping on idle connection returned error");
-            // connection is broken so don't try to close nicely
-            return Err(conn.close_hard().await);
+        // Check that the connection is still live.
+        //
+        // `ping()` is an un-timed round trip on the network drivers, so bound
+        // it: an idle connection whose server stopped answering must cost this
+        // acquire one bound rather than the caller's whole `acquire_timeout`.
+        // On either an error or an expiry the connection is discarded without
+        // an awaited close — see `Floating::discard` for why `close_hard()` is
+        // not used here.
+        match crate::rt::timeout(ACQUIRE_PING_TIMEOUT, conn.ping()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                // an error here means the other end has hung up or we lost connectivity
+                // either way we're fine to just discard the connection
+                // the error itself here isn't necessarily unexpected so WARN is too strong
+                tracing::info!(%error, "ping on idle connection returned error");
+                // connection is broken so don't try to close nicely
+                return Err(conn.discard());
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "ping on idle connection timed out after {:?}",
+                    ACQUIRE_PING_TIMEOUT,
+                );
+                // connection is broken so don't try to close nicely
+                return Err(conn.discard());
+            }
         }
     }
 
@@ -708,12 +737,33 @@ impl<DB: Database> Drop for DecrementSizeGuard<DB> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::borrow::Cow;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
+    use either::Either;
+    use futures_core::future::BoxFuture;
+    use futures_core::stream::BoxStream;
     use sqlx::pool::PoolOptions;
     use sqlx::Sqlite;
 
-    use super::CLOSE_JOIN_TIMEOUT;
+    use crate::arguments::Arguments;
+    use crate::column::Column;
+    use crate::connection::{ConnectOptions, Connection};
+    use crate::database::Database;
+    use crate::encode::Encode;
+    use crate::error::{BoxDynError, Error};
+    use crate::executor::{Execute, Executor};
+    use crate::row::Row;
+    use crate::sql_str::SqlStr;
+    use crate::statement::Statement;
+    use crate::transaction::{Transaction, TransactionManager};
+    use crate::type_info::TypeInfo;
+    use crate::types::Type;
+    use crate::value::{Value, ValueRef};
+
+    use super::{ACQUIRE_PING_TIMEOUT, CLOSE_JOIN_TIMEOUT};
 
     /// `Pool::close()` must not be holdable open forever by a caller that never
     /// returns its connection: the join on checked-out permits is bounded, and
@@ -819,5 +869,455 @@ mod tests {
                 "the connection was not placed in the idle set"
             );
         });
+    }
+
+    /// An idle connection whose server stops answering the liveness ping must
+    /// cost the acquire one bound, not the caller's whole acquire timeout: the
+    /// pool discards it and hands out a fresh connection, reusing the
+    /// discarded connection's pool slot for that replacement.
+    ///
+    /// `max_connections(1)` makes the permit accounting load-bearing: if the
+    /// discarded connection took its slot with it, the replacement connect
+    /// could not happen and the acquire would time out instead of returning.
+    #[test]
+    fn acquire_replaces_an_idle_connection_whose_ping_never_answers() {
+        crate::rt::test_block_on(async {
+            let gate = Arc::new(MockGate::default());
+            // `crate::pool::PoolOptions`, not the facade re-export: the mock's
+            // `Database` impl lives in this crate, and the lib-test target links
+            // the facade as a separate sqlx-core build.
+            let pool = crate::pool::PoolOptions::<MockDb>::new()
+                .max_connections(1)
+                .acquire_timeout(ACQUIRE_PING_TIMEOUT * 3)
+                .connect_with(MockOptions {
+                    gate: Arc::clone(&gate),
+                })
+                .await
+                .expect("build the mock pool");
+
+            assert_eq!(gate.connects(), 1, "connect_with opened no connection");
+            assert_eq!(pool.size(), 1);
+            assert_eq!(pool.num_idle(), 1);
+
+            // Healthy side first: the idle ping answers, the same connection is
+            // handed out, and no new connection is opened.
+            let mut conn = pool
+                .acquire()
+                .await
+                .expect("acquire the healthy idle connection");
+            assert_eq!(conn.id, 1);
+            assert_eq!(
+                gate.connects(),
+                1,
+                "a healthy idle connection was not reused"
+            );
+            conn.return_to_pool().await;
+
+            // Now the server behind the idle connection stops answering.
+            gate.set_wedged(true);
+
+            let start = Instant::now();
+            let mut conn = pool
+                .acquire()
+                .await
+                .expect("acquire a replacement for the wedged idle connection");
+            let elapsed = start.elapsed();
+
+            assert_eq!(
+                conn.id, 2,
+                "the acquire returned the wedged connection instead of a fresh one"
+            );
+            assert_eq!(gate.connects(), 2, "no fresh connection was opened");
+            assert!(
+                elapsed >= ACQUIRE_PING_TIMEOUT,
+                "acquire returned in {elapsed:?}, less than the {ACQUIRE_PING_TIMEOUT:?} ping \
+                 bound, so the idle ping was never bounded"
+            );
+            assert!(
+                elapsed < ACQUIRE_PING_TIMEOUT * 3,
+                "acquire took {elapsed:?}; the idle ping is not bounded by \
+                 {ACQUIRE_PING_TIMEOUT:?}"
+            );
+            assert_eq!(
+                pool.size(),
+                1,
+                "the discarded connection's pool slot was not reused"
+            );
+            assert_eq!(pool.num_idle(), 0);
+
+            // The replacement is wedged too (the gate is shared), so let its
+            // return ping answer before the pool is closed.
+            gate.set_wedged(false);
+            conn.return_to_pool().await;
+            pool.close().await;
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // A mock database for the acquire-side wait bounds.
+    //
+    // The pool's behaviour when a server never answers `Connection::ping()`
+    // is unreachable through the in-memory SQLite driver: SQLite's ping is a
+    // channel send to its worker (`Command::Ping`), so there is nothing to
+    // withhold. This mock exists only to hold a ping open on demand. Every
+    // other method satisfies the trait surface and is never reached by the
+    // pool path under test.
+    // ------------------------------------------------------------------
+
+    #[derive(Debug, Default)]
+    struct MockGate {
+        /// While true, `MockConnection::ping` never completes.
+        wedge: AtomicBool,
+        /// Number of connections opened through these options.
+        connects: AtomicUsize,
+    }
+
+    impl MockGate {
+        fn set_wedged(&self, wedged: bool) {
+            self.wedge.store(wedged, Ordering::SeqCst);
+        }
+
+        fn connects(&self) -> usize {
+            self.connects.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MockDb;
+
+    #[derive(Debug, Clone)]
+    struct MockOptions {
+        gate: Arc<MockGate>,
+    }
+
+    impl Default for MockOptions {
+        fn default() -> Self {
+            Self {
+                gate: Arc::new(MockGate::default()),
+            }
+        }
+    }
+
+    impl std::str::FromStr for MockOptions {
+        type Err = Error;
+
+        fn from_str(_url: &str) -> Result<Self, Self::Err> {
+            Ok(Self::default())
+        }
+    }
+
+    impl ConnectOptions for MockOptions {
+        type Connection = MockConnection;
+
+        fn from_url(_url: &url::Url) -> Result<Self, Error> {
+            Ok(Self::default())
+        }
+
+        async fn connect(&self) -> Result<MockConnection, Error> {
+            let id = self.gate.connects.fetch_add(1, Ordering::SeqCst) + 1;
+
+            Ok(MockConnection {
+                gate: Arc::clone(&self.gate),
+                id,
+            })
+        }
+
+        fn log_statements(self, _level: log::LevelFilter) -> Self {
+            self
+        }
+
+        fn log_slow_statements(self, _level: log::LevelFilter, _duration: Duration) -> Self {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockConnection {
+        gate: Arc<MockGate>,
+        id: usize,
+    }
+
+    impl Connection for MockConnection {
+        type Database = MockDb;
+        type Options = MockOptions;
+
+        async fn close(self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn close_hard(self) -> Result<(), Error> {
+            // NEVER completes. The acquire-path fix must DISCARD the wedged
+            // connection (`Floating::discard`, a synchronous drop), never
+            // await a hard close. An implementation that swapped `discard()`
+            // back to `close_hard().await` would park here until the acquire
+            // timeout and fail the witness — the mutation this mock exists to
+            // kill.
+            std::future::pending::<()>().await;
+
+            Ok(())
+        }
+
+        async fn ping(&mut self) -> Result<(), Error> {
+            if self.gate.wedge.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+
+            Ok(())
+        }
+
+        async fn begin(&mut self) -> Result<Transaction<'_, MockDb>, Error> {
+            unimplemented!("the mock database never begins transactions")
+        }
+
+        fn shrink_buffers(&mut self) {}
+
+        async fn flush(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn should_flush(&self) -> bool {
+            false
+        }
+    }
+
+    impl<'c> Executor<'c> for &'c mut MockConnection {
+        type Database = MockDb;
+
+        fn fetch_many<'e, 'q: 'e, E>(
+            self,
+            _query: E,
+        ) -> BoxStream<'e, Result<Either<MockQueryResult, MockRow>, Error>>
+        where
+            'c: 'e,
+            E: 'q + Execute<'q, MockDb>,
+        {
+            unimplemented!("the mock database never executes statements")
+        }
+
+        fn fetch_optional<'e, 'q: 'e, E>(
+            self,
+            _query: E,
+        ) -> BoxFuture<'e, Result<Option<MockRow>, Error>>
+        where
+            'c: 'e,
+            E: 'q + Execute<'q, MockDb>,
+        {
+            unimplemented!("the mock database never executes statements")
+        }
+
+        fn prepare_with<'e>(
+            self,
+            _sql: SqlStr,
+            _parameters: &'e [MockTypeInfo],
+        ) -> BoxFuture<'e, Result<MockStatement, Error>>
+        where
+            'c: 'e,
+        {
+            unimplemented!("the mock database never prepares statements")
+        }
+
+        #[cfg(feature = "offline")]
+        fn describe<'e>(
+            self,
+            _sql: SqlStr,
+        ) -> BoxFuture<'e, Result<crate::describe::Describe<MockDb>, Error>>
+        where
+            'c: 'e,
+        {
+            unimplemented!("the mock database never describes statements")
+        }
+    }
+
+    impl TransactionManager for MockTransactionManager {
+        type Database = MockDb;
+
+        async fn begin(
+            _conn: &mut MockConnection,
+            _statement: Option<SqlStr>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn commit(_conn: &mut MockConnection) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn rollback(_conn: &mut MockConnection) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn start_rollback(_conn: &mut MockConnection) {}
+
+        fn get_transaction_depth(_conn: &MockConnection) -> usize {
+            0
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockTransactionManager;
+
+    #[derive(Debug, Default)]
+    struct MockQueryResult;
+
+    impl Extend<MockQueryResult> for MockQueryResult {
+        fn extend<I: IntoIterator<Item = MockQueryResult>>(&mut self, _iter: I) {}
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct MockTypeInfo;
+
+    static MOCK_TYPE_INFO: MockTypeInfo = MockTypeInfo;
+
+    impl std::fmt::Display for MockTypeInfo {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(MOCK_TYPE_INFO.name())
+        }
+    }
+
+    impl TypeInfo for MockTypeInfo {
+        fn is_null(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "MOCK"
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockColumn;
+
+    impl Column for MockColumn {
+        type Database = MockDb;
+
+        fn ordinal(&self) -> usize {
+            0
+        }
+
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn type_info(&self) -> &MockTypeInfo {
+            &MOCK_TYPE_INFO
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockRow;
+
+    impl Row for MockRow {
+        type Database = MockDb;
+
+        fn columns(&self) -> &[MockColumn] {
+            &[]
+        }
+
+        fn try_get_raw<I>(&self, _index: I) -> Result<MockValueRef, Error>
+        where
+            I: crate::column::ColumnIndex<Self>,
+        {
+            unimplemented!("the mock database never returns rows")
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockValue;
+
+    #[derive(Debug)]
+    struct MockValueRef;
+
+    impl Value for MockValue {
+        type Database = MockDb;
+
+        fn as_ref(&self) -> MockValueRef {
+            MockValueRef
+        }
+
+        fn type_info(&self) -> Cow<'_, MockTypeInfo> {
+            Cow::Borrowed(&MOCK_TYPE_INFO)
+        }
+
+        fn is_null(&self) -> bool {
+            true
+        }
+    }
+
+    impl<'r> ValueRef<'r> for MockValueRef {
+        type Database = MockDb;
+
+        fn to_owned(&self) -> MockValue {
+            MockValue
+        }
+
+        fn type_info(&self) -> Cow<'_, MockTypeInfo> {
+            Cow::Borrowed(&MOCK_TYPE_INFO)
+        }
+
+        fn is_null(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockStatement;
+
+    impl Statement for MockStatement {
+        type Database = MockDb;
+
+        fn into_sql(self) -> SqlStr {
+            unimplemented!("the mock database never prepares statements")
+        }
+
+        fn sql(&self) -> &SqlStr {
+            unimplemented!("the mock database never prepares statements")
+        }
+
+        fn parameters(&self) -> Option<Either<&[MockTypeInfo], usize>> {
+            None
+        }
+
+        fn columns(&self) -> &[MockColumn] {
+            &[]
+        }
+
+        crate::impl_statement_query!(MockArguments);
+    }
+
+    #[derive(Debug, Default)]
+    struct MockArguments;
+
+    impl Arguments for MockArguments {
+        type Database = MockDb;
+
+        fn reserve(&mut self, _additional: usize, _size: usize) {}
+
+        fn add<'t, T>(&mut self, _value: T) -> Result<(), BoxDynError>
+        where
+            T: Encode<'t, MockDb> + Type<MockDb>,
+        {
+            unimplemented!("the mock database never binds arguments")
+        }
+
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    impl Database for MockDb {
+        type Connection = MockConnection;
+        type TransactionManager = MockTransactionManager;
+        type Row = MockRow;
+        type QueryResult = MockQueryResult;
+        type Column = MockColumn;
+        type TypeInfo = MockTypeInfo;
+        type Value = MockValue;
+        type ValueRef<'r> = MockValueRef;
+        type Arguments = MockArguments;
+        type ArgumentBuffer = Vec<u8>;
+        type Statement = MockStatement;
+
+        const NAME: &'static str = "mock";
+        const URL_SCHEMES: &'static [&'static str] = &["mock"];
     }
 }
