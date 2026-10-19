@@ -814,6 +814,72 @@ mod tls_progress {
         server.join().unwrap();
     }
 
+    /// The ENTRY window of ruling (d): a read that COMPLETES can pull the
+    /// first half of the NEXT TLS record into the session at the same time.
+    /// The idle wait that follows then has empty plaintext and no NEW
+    /// transport progress since that read, so it must still be armed by the
+    /// undecoded bytes the session is holding.
+    ///
+    /// The server sends the LISTEN response and half of the next record in ONE
+    /// write and then holds the socket OPEN and silent — no EOF, so the
+    /// listener's lost-connection/reconnect path is unreachable and the only
+    /// acceptable outcome is the bound firing within one bound of the pull.
+    #[test]
+    fn a_record_pulled_by_the_previous_read_still_bounds_the_next_idle_wait() {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let listener_handle = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = thread::spawn(move || {
+                let mut peer = TlsPeer::accept(listener.accept().unwrap().0);
+                peer.startup();
+                assert_eq!(peer.read_frame().0, b'Q'); // LISTEN
+                                                       // ONE write: the complete LISTEN response record, then the
+                                                       // first half of the next record's ciphertext.
+                let response =
+                    peer.seal(&[message(b'C', b"LISTEN\0"), message(b'Z', b"I")].concat());
+                let notification = message(b'A', &[0, 0, 0, 8, b'c', b'h', b'a', b'n', 0]);
+                let partial = peer.seal(&notification);
+                let mut one_write = response;
+                one_write.extend_from_slice(&partial[..partial.len() / 2]);
+                let mut tcp = peer.tcp();
+                tcp.write_all(&one_write).unwrap();
+                tcp.flush().unwrap();
+                // Hold the socket open and silent: no second half, no EOF.
+                let _ = stopped.recv_timeout(Duration::from_secs(10));
+            });
+            (options(port), handle)
+        };
+        let (options, server) = listener_handle;
+
+        test_block_on(async {
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(WATCHDOG)
+                .connect_lazy_with(options);
+            let mut listener = PgListener::connect_with(&pool).await.unwrap();
+            listener.listen("chan").await.unwrap();
+
+            let started = std::time::Instant::now();
+            let error = timeout(WATCHDOG, listener.try_recv())
+                .await
+                .expect("a partial record held by the session must arm the bound")
+                .expect_err("the partial record must not be deliverable");
+            let elapsed = started.elapsed();
+            assert_timeout(error);
+            assert!(
+                elapsed >= BOUND,
+                "the bound fired before {BOUND:?}: {elapsed:?}"
+            );
+            assert!(
+                elapsed < BOUND * 2,
+                "the idle wait reached {elapsed:?}; the partial record pulled by the previous read did not arm the bound"
+            );
+        });
+        let _ = stop.send(());
+        server.join().unwrap();
+    }
+
     /// The other half of S2: an idle listener with NO transport activity at all
     /// must keep waiting — the bound arms on the first byte, it does not fire
     /// on a quiet connection.
