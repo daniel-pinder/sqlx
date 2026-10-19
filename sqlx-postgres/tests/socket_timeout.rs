@@ -808,18 +808,6 @@ mod tls_progress {
         out
     }
 
-    async fn read_exact(socket: &mut Box<dyn Socket>, len: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(len);
-        while out.len() < len {
-            let mut chunk = vec![0u8; len - out.len()];
-            let mut target: &mut [u8] = &mut chunk;
-            let read = socket.read(&mut target).await.expect("protocol read");
-            assert!(read > 0, "the scripted peer closed during bootstrap");
-            out.extend_from_slice(&chunk[..read]);
-        }
-        out
-    }
-
     struct Bootstrapped {
         socket: BufferedSocket<Box<dyn Socket>>,
         /// Raw bytes read through the startup response.
@@ -836,7 +824,7 @@ mod tls_progress {
     /// pulled by these reads.
     async fn bootstrap(port: u16, reads: Arc<RawReads>) -> Bootstrapped {
         let ca = CertificateInput::File(format!("{CERT_DIR}/ca.crt").into());
-        let mut socket = connect_tcp(
+        let socket = connect_tcp(
             "127.0.0.1",
             port,
             CountedTlsUpgrade {
@@ -848,24 +836,31 @@ mod tls_progress {
         .expect("TCP connect")
         .expect("TLS upgrade");
 
-        socket.write(&startup_message()).await.expect("startup");
+        // The SAME buffered socket a driver uses, from the first exchange on:
+        // its "progress since the last completed read" memory has to be primed
+        // by these reads, or the entry window under test is not the driver's.
+        let mut socket = BufferedSocket::new(socket);
+        socket.set_io_timeout(Some(BOUND));
+
+        let startup = startup_message();
+        socket.write(startup.as_slice()).expect("startup write");
         socket.flush().await.expect("startup flush");
-        let ready = read_exact(&mut socket, 15).await; // AuthenticationOk + ReadyForQuery
+        let ready = socket.read_buffered(15).await.expect("startup response");
+        // AuthenticationOk + ReadyForQuery
         assert_eq!(ready[0], b'R');
         assert_eq!(ready[9], b'Z');
         let after_startup = reads.bytes();
 
-        socket
-            .write(&query("LISTEN \"chan\""))
-            .await
-            .expect("LISTEN");
+        let listen = query("LISTEN \"chan\"");
+        socket.write(listen.as_slice()).expect("LISTEN write");
         socket.flush().await.expect("LISTEN flush");
-        let done = read_exact(&mut socket, 18).await; // CommandComplete + ReadyForQuery
+        let done = socket.read_buffered(18).await.expect("LISTEN response");
+        // CommandComplete + ReadyForQuery
         assert_eq!(done[0], b'C');
         assert_eq!(done[12], b'Z');
 
         Bootstrapped {
-            socket: BufferedSocket::new(socket),
+            socket,
             after_startup,
             after_listen: reads.bytes(),
             last_read: reads.last(),
