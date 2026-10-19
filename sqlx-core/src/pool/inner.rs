@@ -36,17 +36,6 @@ use tracing::Level;
 /// `PoolOptions` API for a fork patch. 5s matches `CLOSE_ON_DROP_TIMEOUT`.
 const CLOSE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bound on the idle-connection liveness ping `check_idle_conn()` performs
-/// before handing a pooled connection back to a caller.
-///
-/// `Connection::ping()` is an un-timed round trip on the network drivers, so a
-/// server that stopped answering would hold the acquire for its whole
-/// `acquire_timeout` — and, where the acquire loop is not deadline-wrapped,
-/// indefinitely. On expiry the connection is discarded without an awaited
-/// close (see `Floating::discard`) and the slot is reused for a fresh
-/// connection. 5s matches `RELEASE_PING_TIMEOUT` and `CLOSE_ON_DROP_TIMEOUT`.
-const ACQUIRE_PING_TIMEOUT: Duration = Duration::from_secs(5);
-
 pub(crate) struct PoolInner<DB: Database> {
     pub(super) connect_options: RwLock<Arc<<DB::Connection as Connection>::Options>>,
     pub(super) idle_conns: ArrayQueue<Idle<DB>>,
@@ -345,7 +334,7 @@ impl<DB: Database> PoolInner<DB> {
                     let guard = match self.pop_idle(permit) {
 
                         // Then, check that we can use it...
-                        Ok(conn) => match check_idle_conn(conn, &self.options).await {
+                        Ok(conn) => match check_idle_conn(conn, &self.options, deadline).await {
 
                             // All good!
                             Ok(live) => return Ok(live),
@@ -551,17 +540,23 @@ fn is_beyond_idle_timeout<DB: Database>(idle: &Idle<DB>, options: &PoolOptions<D
 async fn check_idle_conn<DB: Database>(
     mut conn: Floating<DB, Idle<DB>>,
     options: &PoolOptions<DB>,
+    deadline: Instant,
 ) -> Result<Floating<DB, Live<DB>>, DecrementSizeGuard<DB>> {
     if options.test_before_acquire {
         // Check that the connection is still live.
         //
         // `ping()` is an un-timed round trip on the network drivers, so bound
-        // it: an idle connection whose server stopped answering must cost this
-        // acquire one bound rather than the caller's whole `acquire_timeout`.
+        // it. The budget is HALF the acquire time still remaining, not a fixed
+        // bound: a server that has stopped answering must cost this acquire at
+        // most half of its budget, so the loop keeps enough time to discard the
+        // connection and open a fresh one. A fixed bound equal to the fleet's
+        // `acquire_timeout` spent the whole budget and turned the recovery into
+        // `PoolTimedOut` — the failure this bound exists to prevent.
         // On either an error or an expiry the connection is discarded without
         // an awaited close — see `Floating::discard` for why `close_hard()` is
         // not used here.
-        match crate::rt::timeout(ACQUIRE_PING_TIMEOUT, conn.ping()).await {
+        let ping_budget = deadline.saturating_duration_since(Instant::now()) / 2;
+        match crate::rt::timeout(ping_budget, conn.ping()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 // an error here means the other end has hung up or we lost connectivity
@@ -572,10 +567,7 @@ async fn check_idle_conn<DB: Database>(
                 return Err(conn.discard());
             }
             Err(_elapsed) => {
-                tracing::warn!(
-                    "ping on idle connection timed out after {:?}",
-                    ACQUIRE_PING_TIMEOUT,
-                );
+                tracing::warn!("ping on idle connection timed out after {:?}", ping_budget,);
                 // connection is broken so don't try to close nicely
                 return Err(conn.discard());
             }
@@ -763,7 +755,7 @@ mod tests {
     use crate::types::Type;
     use crate::value::{Value, ValueRef};
 
-    use super::{ACQUIRE_PING_TIMEOUT, CLOSE_JOIN_TIMEOUT};
+    use super::CLOSE_JOIN_TIMEOUT;
 
     /// `Pool::close()` must not be holdable open forever by a caller that never
     /// returns its connection: the join on checked-out permits is bounded, and
@@ -871,10 +863,17 @@ mod tests {
         });
     }
 
+    /// The fleet's `acquire_timeout`. The ping budget is derived from it (half
+    /// of what remains), so a wedged ping leaves enough time to reconnect.
+    const ACQUIRE_BUDGET: Duration = Duration::from_secs(5);
+
     /// An idle connection whose server stops answering the liveness ping must
-    /// cost the acquire one bound, not the caller's whole acquire timeout: the
-    /// pool discards it and hands out a fresh connection, reusing the
-    /// discarded connection's pool slot for that replacement.
+    /// cost the acquire at most HALF its budget, not the whole of it: the pool
+    /// discards the connection and hands out a fresh one, reusing the discarded
+    /// connection's pool slot, and the acquire still SUCCEEDS inside the
+    /// caller's timeout. A fixed ping bound equal to `acquire_timeout` would
+    /// spend the whole budget and fail the acquire `PoolTimedOut` — the
+    /// recovery this bound exists to make possible.
     ///
     /// `max_connections(1)` makes the permit accounting load-bearing: if the
     /// discarded connection took its slot with it, the replacement connect
@@ -888,7 +887,7 @@ mod tests {
             // the facade as a separate sqlx-core build.
             let pool = crate::pool::PoolOptions::<MockDb>::new()
                 .max_connections(1)
-                .acquire_timeout(ACQUIRE_PING_TIMEOUT * 3)
+                .acquire_timeout(ACQUIRE_BUDGET)
                 .connect_with(MockOptions {
                     gate: Arc::clone(&gate),
                 })
@@ -929,14 +928,14 @@ mod tests {
             );
             assert_eq!(gate.connects(), 2, "no fresh connection was opened");
             assert!(
-                elapsed >= ACQUIRE_PING_TIMEOUT,
-                "acquire returned in {elapsed:?}, less than the {ACQUIRE_PING_TIMEOUT:?} ping \
-                 bound, so the idle ping was never bounded"
+                elapsed >= ACQUIRE_BUDGET / 2,
+                "acquire returned in {elapsed:?}, less than half the {ACQUIRE_BUDGET:?} \
+                 budget, so the idle ping was never bounded"
             );
             assert!(
-                elapsed < ACQUIRE_PING_TIMEOUT * 3,
-                "acquire took {elapsed:?}; the idle ping is not bounded by \
-                 {ACQUIRE_PING_TIMEOUT:?}"
+                elapsed < ACQUIRE_BUDGET,
+                "acquire took {elapsed:?}; the ping spent so much of the \
+                 {ACQUIRE_BUDGET:?} budget that the replacement did not fit"
             );
             assert_eq!(
                 pool.size(),
@@ -948,6 +947,90 @@ mod tests {
             // The replacement is wedged too (the gate is shared), so let its
             // return ping answer before the pool is closed.
             gate.set_wedged(false);
+            conn.return_to_pool().await;
+            pool.close().await;
+        });
+    }
+
+    /// A ping that FAILS (the peer hung up) must be answered by an immediate
+    /// discard and reconnect — the fast arm of the same bound, well inside the
+    /// budget rather than waiting it out.
+    #[test]
+    fn acquire_reconnects_immediately_when_the_ping_errors() {
+        crate::rt::test_block_on(async {
+            let gate = Arc::new(MockGate::default());
+            let pool = crate::pool::PoolOptions::<MockDb>::new()
+                .max_connections(1)
+                .acquire_timeout(ACQUIRE_BUDGET)
+                .connect_with(MockOptions {
+                    gate: Arc::clone(&gate),
+                })
+                .await
+                .expect("build the mock pool");
+            assert_eq!(pool.num_idle(), 1);
+
+            gate.set_fail_ping(true);
+
+            let start = Instant::now();
+            let mut conn = pool
+                .acquire()
+                .await
+                .expect("a failing ping must be replaced, not surfaced");
+            let elapsed = start.elapsed();
+
+            assert_eq!(conn.id, 2, "the failed-ping connection was handed out");
+            assert_eq!(gate.connects(), 2, "no fresh connection was opened");
+            assert!(
+                elapsed < ACQUIRE_BUDGET / 4,
+                "a failing ping took {elapsed:?}; it must be discarded at once, not held \
+                 for the {ACQUIRE_BUDGET:?} budget"
+            );
+            assert_eq!(pool.size(), 1);
+
+            gate.set_fail_ping(false);
+            conn.return_to_pool().await;
+            pool.close().await;
+        });
+    }
+
+    /// Cancelling an acquire while the liveness ping is in flight must leave
+    /// the pool usable: the popped connection and its size guard are released
+    /// with the dropped future, so the only permit is not stranded.
+    #[test]
+    fn dropping_an_acquire_mid_ping_does_not_strand_the_pool() {
+        crate::rt::test_block_on(async {
+            let gate = Arc::new(MockGate::default());
+            let pool = crate::pool::PoolOptions::<MockDb>::new()
+                .max_connections(1)
+                .acquire_timeout(ACQUIRE_BUDGET)
+                .connect_with(MockOptions {
+                    gate: Arc::clone(&gate),
+                })
+                .await
+                .expect("build the mock pool");
+            assert_eq!(pool.num_idle(), 1);
+
+            // The server stops answering and the caller gives up mid-ping.
+            gate.set_wedged(true);
+            {
+                let acquire = pool.acquire();
+                let mut acquire = std::pin::pin!(acquire);
+                let polled = crate::rt::timeout(Duration::from_millis(100), &mut acquire).await;
+                assert!(
+                    polled.is_err(),
+                    "the liveness ping must still be in flight when the caller is dropped"
+                );
+                // `acquire` (and the connection it popped) is dropped here.
+            }
+
+            // The permit and the size guard must not have leaked with it.
+            gate.set_wedged(false);
+            let mut conn = crate::rt::timeout(Duration::from_secs(2), pool.acquire())
+                .await
+                .expect("a cancelled acquire stranded the pool's only permit")
+                .expect("acquire after a cancelled ping");
+            assert_eq!(pool.size(), 1, "the pool's size accounting drifted");
+
             conn.return_to_pool().await;
             pool.close().await;
         });
@@ -968,6 +1051,8 @@ mod tests {
     struct MockGate {
         /// While true, `MockConnection::ping` never completes.
         wedge: AtomicBool,
+        /// While true, `MockConnection::ping` returns an error immediately.
+        fail_ping: AtomicBool,
         /// Number of connections opened through these options.
         connects: AtomicUsize,
     }
@@ -975,6 +1060,10 @@ mod tests {
     impl MockGate {
         fn set_wedged(&self, wedged: bool) {
             self.wedge.store(wedged, Ordering::SeqCst);
+        }
+
+        fn set_fail_ping(&self, fail: bool) {
+            self.fail_ping.store(fail, Ordering::SeqCst);
         }
 
         fn connects(&self) -> usize {
@@ -1058,6 +1147,12 @@ mod tests {
         }
 
         async fn ping(&mut self) -> Result<(), Error> {
+            if self.gate.fail_ping.load(Ordering::SeqCst) {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "mock ping failure",
+                )));
+            }
             if self.gate.wedge.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
