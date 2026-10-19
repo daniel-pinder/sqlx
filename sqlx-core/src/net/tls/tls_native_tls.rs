@@ -35,6 +35,16 @@ impl<S: Socket> Socket for NativeTlsSocket<S> {
         self.stream.get_ref().last_transport_progress()
     }
 
+    fn last_receive_progress(&self) -> Option<std::time::Instant> {
+        self.stream.get_ref().last_receive_progress()
+    }
+
+    fn has_incomplete_incoming_record(&self) -> bool {
+        // OpenSSL buffers a partly received record out of sight of its
+        // plaintext API; the adapter under it observed the framing.
+        self.stream.get_ref().has_incomplete_incoming_record()
+    }
+
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.stream.shutdown() {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.stream.get_mut().poll_ready(cx),

@@ -13,6 +13,54 @@ pub struct StdSocket<S> {
     /// record arriving in fragments moves this instant while the plaintext
     /// buffer stays empty.
     last_transport_progress: Option<std::time::Instant>,
+    /// When ciphertext was last READ. Receive activity is the only evidence
+    /// that an incoming message started arriving; a write must not arm a
+    /// read wait.
+    last_receive_progress: Option<std::time::Instant>,
+    /// TLS record framing over the ciphertext consumed so far, so a prefix of
+    /// a record pulled by a previous read is still visible to the next wait.
+    records: RecordFramer,
+}
+
+/// Counts TLS record framing in the ciphertext stream: a five-byte header
+/// (content type, version, length) followed by `length` body bytes. It never
+/// decrypts — it only walks bytes — so it works for every backend above it.
+///
+/// The state is deliberately NOT cleared when a SQLx message is consumed: the
+/// record and the message are different units, and consuming a message says
+/// nothing about the next record's framing. Only a record COMPLETING retires
+/// its own state.
+#[derive(Default)]
+struct RecordFramer {
+    header: [u8; 5],
+    header_len: usize,
+    body_remaining: usize,
+}
+
+impl RecordFramer {
+    fn observe(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.body_remaining > 0 {
+                let consumed = std::cmp::min(self.body_remaining, bytes.len());
+                self.body_remaining -= consumed;
+                bytes = &bytes[consumed..];
+                continue;
+            }
+
+            self.header[self.header_len] = bytes[0];
+            self.header_len += 1;
+            bytes = &bytes[1..];
+
+            if self.header_len == self.header.len() {
+                self.body_remaining = u16::from_be_bytes([self.header[3], self.header[4]]) as usize;
+                self.header_len = 0;
+            }
+        }
+    }
+
+    fn is_incomplete(&self) -> bool {
+        self.header_len > 0 || self.body_remaining > 0
+    }
 }
 
 impl<S: Socket> StdSocket<S> {
@@ -22,6 +70,8 @@ impl<S: Socket> StdSocket<S> {
             wants_read: false,
             wants_write: false,
             last_transport_progress: None,
+            last_receive_progress: None,
+            records: RecordFramer::default(),
         }
     }
 
@@ -62,15 +112,31 @@ impl<S: Socket> StdSocket<S> {
     pub fn last_transport_progress(&self) -> Option<std::time::Instant> {
         self.last_transport_progress
     }
+
+    /// When ciphertext was last received, if ever.
+    pub fn last_receive_progress(&self) -> Option<std::time::Instant> {
+        self.last_receive_progress
+    }
+
+    /// Whether the ciphertext consumed so far ends inside a TLS record.
+    pub fn has_incomplete_incoming_record(&self) -> bool {
+        self.records.is_incomplete()
+    }
 }
 
 impl<S: Socket> Read for StdSocket<S> {
-    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.wants_read = true;
-        let read = self.socket.try_read(&mut buf)?;
+        // `BufMut` semantics advance the slice it is handed, so pass a
+        // REBORROW: the bytes are written through it into `buf`, but `buf`
+        // itself still starts at the first byte read.
+        let read = self.socket.try_read(&mut &mut *buf)?;
         self.wants_read = false;
         if read > 0 {
-            self.last_transport_progress = Some(std::time::Instant::now());
+            let now = std::time::Instant::now();
+            self.last_transport_progress = Some(now);
+            self.last_receive_progress = Some(now);
+            self.records.observe(&buf[..read]);
         }
 
         Ok(read)

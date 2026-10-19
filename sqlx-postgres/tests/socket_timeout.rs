@@ -514,13 +514,17 @@ fn partial_reads_reset_the_inactivity_timeout() {
 mod tls_progress {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::Arc;
+    use std::ops::ControlFlow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use sqlx_core::connection::ConnectOptions;
     use sqlx_core::executor::Executor;
-    use sqlx_core::rt::{test_block_on, timeout};
+    use sqlx_core::net::tls::{self, CertificateInput, TlsConfig};
+    use sqlx_core::net::{connect_tcp, BufferedSocket, Socket, SocketIntoBox, WithSocket};
+    use sqlx_core::rt::{sleep, test_block_on, timeout};
     use sqlx_postgres::{PgConnectOptions, PgListener, PgPoolOptions, PgSslMode};
 
     use super::{assert_timeout, BOUND, WATCHDOG};
@@ -663,6 +667,311 @@ mod tls_progress {
         (options(port), handle)
     }
 
+    /// Raw-TCP read accounting shared with the witness, so the test can prove
+    /// the next record's prefix had ALREADY crossed the client's raw-read
+    /// boundary before the idle wait began. One server write alone cannot
+    /// guarantee one client read, so the precondition is asserted, not
+    /// assumed.
+    #[derive(Default)]
+    struct RawReads {
+        bytes: AtomicUsize,
+        last: Mutex<Option<Instant>>,
+    }
+
+    impl RawReads {
+        fn record(&self, bytes: usize) {
+            self.bytes.fetch_add(bytes, Ordering::SeqCst);
+            *self.last.lock().unwrap() = Some(Instant::now());
+        }
+
+        fn bytes(&self) -> usize {
+            self.bytes.load(Ordering::SeqCst)
+        }
+
+        fn last(&self) -> Option<Instant> {
+            *self.last.lock().unwrap()
+        }
+    }
+
+    /// The transport under `StdSocket`: counts raw bytes so the witness can
+    /// see what the TLS session consumed.
+    struct CountingSocket<S> {
+        inner: S,
+        reads: Arc<RawReads>,
+    }
+
+    impl<S: Socket> Socket for CountingSocket<S> {
+        fn try_read(&mut self, buf: &mut dyn sqlx_core::io::ReadBuf) -> std::io::Result<usize> {
+            let read = self.inner.try_read(buf)?;
+            if read > 0 {
+                self.reads.record(read);
+            }
+            Ok(read)
+        }
+
+        fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.try_write(buf)
+        }
+
+        fn poll_read_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.inner.poll_read_ready(cx)
+        }
+
+        fn poll_write_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.inner.poll_write_ready(cx)
+        }
+
+        fn poll_shutdown(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.inner.poll_shutdown(cx)
+        }
+
+        fn last_transport_progress(&self) -> Option<Instant> {
+            self.inner.last_transport_progress()
+        }
+
+        fn last_receive_progress(&self) -> Option<Instant> {
+            self.inner.last_receive_progress()
+        }
+
+        fn has_incomplete_incoming_record(&self) -> bool {
+            // Record framing above this transport is what can be part-way
+            // through; a raw socket has no framing of its own.
+            false
+        }
+    }
+
+    /// Performs the Postgres SSLRequest and the TLS upgrade over a counted
+    /// raw socket, exactly as the driver's `MaybeUpgradeTls` does.
+    struct CountedTlsUpgrade {
+        reads: Arc<RawReads>,
+        ca: CertificateInput,
+    }
+
+    impl WithSocket for CountedTlsUpgrade {
+        type Output = sqlx_core::Result<Box<dyn Socket>>;
+
+        async fn with_socket<S: Socket>(self, socket: S) -> Self::Output {
+            let mut socket = CountingSocket {
+                inner: socket,
+                reads: self.reads,
+            };
+
+            // SSLRequest: length 8, code 80877103.
+            socket.write(&[0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F]).await?;
+            socket.flush().await?;
+            let mut answer = [0u8; 1];
+            {
+                let mut target: &mut [u8] = &mut answer;
+                socket.read(&mut target).await?;
+            }
+            assert_eq!(&answer, b"S", "the scripted peer must accept TLS");
+
+            let config = TlsConfig {
+                accept_invalid_certs: false,
+                accept_invalid_hostnames: true,
+                hostname: "127.0.0.1",
+                root_cert_path: Some(&self.ca),
+                client_cert_path: None,
+                client_key_path: None,
+            };
+
+            tls::handshake(socket, config, SocketIntoBox).await
+        }
+    }
+
+    fn startup_message() -> Vec<u8> {
+        let mut body = vec![0, 3, 0, 0]; // protocol 3.0
+        body.extend_from_slice(b"user\0test\0database\0test\0\0");
+        let mut out = u32::try_from(body.len() + 4)
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn query(sql: &str) -> Vec<u8> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        let mut out = vec![b'Q'];
+        out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    struct Bootstrapped {
+        socket: BufferedSocket<Box<dyn Socket>>,
+        /// Raw bytes read through the startup response.
+        after_startup: usize,
+        /// Raw bytes read through the LISTEN response — plus anything the
+        /// same reads pulled with it.
+        after_listen: usize,
+    }
+
+    /// Connect over TLS and complete the startup + LISTEN exchange, leaving
+    /// the socket idle. Any bytes read beyond the LISTEN response record were
+    /// pulled by these reads.
+    async fn bootstrap(port: u16, reads: Arc<RawReads>) -> Bootstrapped {
+        let ca = CertificateInput::File(format!("{CERT_DIR}/ca.crt").into());
+        let socket = connect_tcp(
+            "127.0.0.1",
+            port,
+            CountedTlsUpgrade {
+                reads: reads.clone(),
+                ca,
+            },
+        )
+        .await
+        .expect("TCP connect")
+        .expect("TLS upgrade");
+
+        // The SAME buffered socket a driver uses, from the first exchange on:
+        // its "progress since the last completed read" memory has to be primed
+        // by these reads, or the entry window under test is not the driver's.
+        let mut socket = BufferedSocket::new(socket);
+        socket.set_io_timeout(Some(BOUND));
+
+        let startup = startup_message();
+        socket.write(startup.as_slice()).expect("startup write");
+        socket.flush().await.expect("startup flush");
+        let ready = socket.read_buffered(15).await.expect("startup response");
+        // AuthenticationOk + ReadyForQuery
+        assert_eq!(ready[0], b'R');
+        assert_eq!(ready[9], b'Z');
+        let after_startup = reads.bytes();
+
+        let listen = query("LISTEN \"chan\"");
+        socket.write(listen.as_slice()).expect("LISTEN write");
+        socket.flush().await.expect("LISTEN flush");
+        let done = socket.read_buffered(18).await.expect("LISTEN response");
+        // CommandComplete + ReadyForQuery
+        assert_eq!(done[0], b'C');
+        assert_eq!(done[12], b'Z');
+
+        Bootstrapped {
+            socket,
+            after_startup,
+            after_listen: reads.bytes(),
+        }
+    }
+
+    fn notification() -> Vec<u8> {
+        message(b'A', &[0, 0, 0, 8, b'c', b'h', b'a', b'n', 0])
+    }
+
+    fn wait_for_a_byte(
+        buf: &mut sqlx_core::bytes::BytesMut,
+    ) -> Result<ControlFlow<(), usize>, sqlx_core::Error> {
+        Ok(ControlFlow::Continue(buf.len() + 1))
+    }
+
+    /// Script a peer that answers LISTEN, then sends the response record and
+    /// the first half of the next record AS ONE WRITE, and keeps the
+    /// connection OPEN and SILENT — no second half, no EOF, so a reconnect
+    /// path is unreachable. The response record's wire length arrives on the
+    /// channel for the precondition assertion.
+    fn prefetch_peer() -> (
+        u16,
+        std::sync::mpsc::Receiver<(usize, usize)>,
+        std::sync::mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let mut peer = TlsPeer::accept(listener.accept().unwrap().0);
+            peer.startup();
+            assert_eq!(peer.read_frame().0, b'Q'); // LISTEN
+            let response = peer.seal(&[message(b'C', b"LISTEN\0"), message(b'Z', b"I")].concat());
+            let partial = peer.seal(&notification());
+            let record_a = response.len();
+            let mut one_write = response;
+            one_write.extend_from_slice(&partial[..partial.len() / 2]);
+            let mut tcp = peer.tcp();
+            let wrote = tcp.write(&one_write).unwrap();
+            assert_eq!(
+                wrote,
+                one_write.len(),
+                "one write must carry the response record and the prefix"
+            );
+            tcp.flush().unwrap();
+            // (the response record on its own, the whole single write)
+            tx.send((record_a, one_write.len())).unwrap();
+            // Hold the socket open and silent: no second half, no EOF.
+            let _ = stopped.recv_timeout(Duration::from_secs(10));
+        });
+        (port, rx, stop, handle)
+    }
+
+    /// Tests run in parallel in one process, so a callsite whose first event
+    /// fires outside any thread-local subscriber can be cached as disabled
+    /// and never reach a later `with_default`. A global subscriber that is
+    /// interested in everything keeps every callsite open; the events are
+    /// still delivered to the thread-local subscriber that is installed
+    /// around the wait.
+    struct InterestKeepAlive;
+
+    impl tracing::Subscriber for InterestKeepAlive {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn install_interest_keepalive() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Another test may have installed one first; either is fine, the
+            // callsite interest is what matters.
+            let _ = tracing::subscriber::set_global_default(InterestKeepAlive);
+        });
+    }
+
+    #[derive(Default)]
+    struct PoisonWarnings {
+        count: AtomicUsize,
+    }
+
+    impl tracing::Subscriber for PoisonWarnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            // The poison line names the socket; connect-phase warnings name
+            // host/port and must not count here.
+            if event.metadata().target() == "sqlx::net::timeout"
+                && event.fields().any(|field| field.name() == "socket_id")
+            {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     /// S1: a single TLS record whose ciphertext arrives in fragments over more
     /// than the bound must NOT time out — the transport is making progress, so
     /// the bound restarts (SO_RCVTIMEO semantics), and the query succeeds.
@@ -772,6 +1081,253 @@ mod tls_progress {
                 "silence reached nearly two bounds: {elapsed:?}"
             );
         });
+        server.join().unwrap();
+    }
+
+    /// A message that spans TWO TLS records — record 1 delivers the frame
+    /// header, record 2 never arrives — must time out on an idle listener.
+    /// The bound arms on the first byte of the MESSAGE that the session
+    /// delivered (partial plaintext), not only on ciphertext it has buffered:
+    /// the single-record witness above covers "no plaintext yet", this one
+    /// covers "some plaintext, rest missing".
+    #[test]
+    fn partial_message_across_two_tls_records_times_out_on_an_idle_listener() {
+        let (options, server) = listener(|mut peer| {
+            peer.startup();
+            assert_eq!(peer.read_frame().0, b'Q'); // LISTEN
+            peer.write_plain(&[message(b'C', b"LISTEN\0"), message(b'Z', b"I")].concat());
+
+            // Record 1 carries only the 5-byte header of a notification; the
+            // record with its body is never sent.
+            let notification = message(b'A', &[0, 0, 0, 8, b'c', b'h', b'a', b'n', 0]);
+            let wire = peer.seal(&notification[..5]);
+            let mut tcp = peer.tcp();
+            tcp.write_all(&wire).unwrap();
+            tcp.flush().unwrap();
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        test_block_on(async {
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(WATCHDOG)
+                .connect_lazy_with(options);
+            let mut listener = PgListener::connect_with(&pool).await.unwrap();
+            listener.listen("chan").await.unwrap();
+            let error = timeout(WATCHDOG, listener.try_recv())
+                .await
+                .expect("a message that started arriving must arm the bound")
+                .expect_err("the incomplete message must not be deliverable");
+            assert_timeout(error);
+        });
+        server.join().unwrap();
+    }
+
+    /// The ENTRY window of ruling (d), on the public listener: a read that
+    /// COMPLETES can pull the first half of the NEXT TLS record into the
+    /// session at the same time. The idle wait that follows then has empty
+    /// plaintext and no NEW transport progress since that read, so the bound
+    /// must be armed by the undecoded bytes the session is holding.
+    ///
+    /// The deterministic precondition — the prefix crossed the client's
+    /// raw-read boundary BEFORE the wait — is asserted in
+    /// `a_record_prefetched_by_the_previous_read_bounds_the_next_idle_wait`,
+    /// which owns the raw socket; this witness drives the public API. The
+    /// peer keeps the connection OPEN and SILENT: no EOF, so a lost-connection
+    /// path cannot mask the bound. The connection is not re-established
+    /// (`eager_reconnect(false)`), so the original socket's poison is the one
+    /// and only outcome, and `try_recv` reports `Ok(None)`.
+    #[test]
+    fn a_record_pulled_by_the_previous_read_still_bounds_the_next_idle_wait() {
+        let (port, record_a, stop, server) = prefetch_peer();
+        let poison = Arc::new(PoisonWarnings::default());
+
+        install_interest_keepalive();
+        let elapsed = tracing::subscriber::with_default(poison.clone(), || {
+            test_block_on(async {
+                let options = options(port);
+                let pool = PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(WATCHDOG)
+                    .connect_lazy_with(options);
+                let mut listener = PgListener::connect_with(&pool).await.unwrap();
+                listener.listen("chan").await.unwrap();
+                listener.eager_reconnect(false);
+
+                let (record_a, wire_len) = record_a.recv_timeout(WATCHDOG).expect("server lengths");
+                assert!(record_a > 0 && wire_len > record_a);
+
+                let started = Instant::now();
+                let waited = timeout(WATCHDOG, listener.try_recv())
+                    .await
+                    .expect("the prefetched partial record must arm the bound");
+                let elapsed = started.elapsed();
+                let notification = waited.expect("a poisoned connection is not a query error");
+                assert!(
+                    notification.is_none(),
+                    "the partial record must not be deliverable"
+                );
+                assert!(
+                    elapsed < BOUND + Duration::from_millis(500),
+                    "the idle wait reached {elapsed:?}; the partial record pulled by the \
+                     previous read did not bound it"
+                );
+                elapsed
+            })
+        });
+
+        assert!(
+            elapsed < BOUND + Duration::from_millis(500),
+            "the bound must fire without waiting for the outer watchdog"
+        );
+        assert_eq!(
+            poison.count.load(Ordering::SeqCst),
+            1,
+            "exactly one poison warning for the original socket"
+        );
+        let _ = stop.send(());
+        server.join().unwrap();
+    }
+
+    /// What the bootstrap's reads pulled beyond the LISTEN response record.
+    /// A read-ahead backend (rustls) pulls the next record's prefix; a
+    /// record-at-a-time backend (OpenSSL under native-tls) stops at the
+    /// record boundary and the prefix arrives during the idle wait instead.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EntryWindow {
+        Prefetched,
+        NotPrefetched,
+    }
+
+    fn classify_entry_window(boot: &Bootstrapped, record_a: usize, wire_len: usize) -> EntryWindow {
+        let pulled = boot.after_listen - boot.after_startup;
+        if pulled > record_a {
+            assert_eq!(
+                pulled, wire_len,
+                "a read-ahead backend pulls the whole single write"
+            );
+            EntryWindow::Prefetched
+        } else {
+            assert_eq!(
+                pulled, record_a,
+                "a record-at-a-time backend stops exactly at the response record's boundary"
+            );
+            EntryWindow::NotPrefetched
+        }
+    }
+
+    /// The entry window, asserted on the raw socket: the read that COMPLETES
+    /// the LISTEN exchange may also pull the first half of the NEXT record,
+    /// and the idle wait that follows has empty plaintext and no NEW transport
+    /// progress since that read. The bound must fire at ONE bound measured
+    /// from the LAST RECEIVED BYTE — the original anchor, not a fresh one from
+    /// the wait's entry. On old code the prefetched byte is invisible and the
+    /// wait runs into the outer watchdog; a record-at-a-time backend delivers
+    /// the prefix during the wait and the transport-progress rule bounds it,
+    /// which the same assertion pins.
+    #[test]
+    fn a_record_at_the_entry_window_bounds_the_next_idle_wait() {
+        let (port, lengths, stop, server) = prefetch_peer();
+        let reads = Arc::new(RawReads::default());
+
+        test_block_on(async {
+            let boot = timeout(WATCHDOG, bootstrap(port, reads.clone()))
+                .await
+                .expect("bootstrap must complete");
+            let (record_a, wire_len) = lengths.recv_timeout(WATCHDOG).expect("server lengths");
+            let window = classify_entry_window(&boot, record_a, wire_len);
+
+            let mut socket = boot.socket;
+            socket.set_io_timeout(Some(BOUND));
+
+            let error = timeout(WATCHDOG, socket.try_read_idle(wait_for_a_byte))
+                .await
+                .expect("a record in flight must arm the bound")
+                .unwrap_err();
+            let fired_at = Instant::now();
+            assert_timeout(error);
+
+            let last_byte = reads.last().expect("a received byte must be recorded");
+            let from_byte = fired_at.duration_since(last_byte);
+            assert!(
+                from_byte >= BOUND,
+                "the wait fired before the received byte's bound ({window:?}): {from_byte:?}"
+            );
+            assert!(
+                from_byte < BOUND + Duration::from_millis(500),
+                "the deadline was renewed past the received byte ({window:?}): {from_byte:?}"
+            );
+
+            // The poison is permanent: the next wait fails immediately with
+            // the same typed error instead of waiting again.
+            let started = Instant::now();
+            let again = socket.try_read_idle(wait_for_a_byte).await.unwrap_err();
+            assert_timeout(again);
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "a poisoned socket must not wait again"
+            );
+        });
+        let _ = stop.send(());
+        server.join().unwrap();
+    }
+
+    /// The same record, with a DELAYED entry: the wait starts half a bound
+    /// after the response. When the prefix was already pulled, the deadline
+    /// must still fall at ITS byte's bound, not restart from the entry (a
+    /// renewed full bound would let a dead peer hold the connection for up to
+    /// two bounds). A record-at-a-time backend has no earlier byte to renew:
+    /// the prefix arrives at the entry, so exactly one bound from there is the
+    /// correct answer and the assertion says so.
+    #[test]
+    fn a_delayed_idle_wait_is_not_granted_a_fresh_bound() {
+        let (port, lengths, stop, server) = prefetch_peer();
+        let reads = Arc::new(RawReads::default());
+
+        test_block_on(async {
+            let boot = timeout(WATCHDOG, bootstrap(port, reads.clone()))
+                .await
+                .expect("bootstrap must complete");
+            let (record_a, wire_len) = lengths.recv_timeout(WATCHDOG).expect("server lengths");
+            let window = classify_entry_window(&boot, record_a, wire_len);
+
+            let mut socket = boot.socket;
+            socket.set_io_timeout(Some(BOUND));
+
+            // Enter the wait half a bound late.
+            sleep(BOUND / 2).await;
+
+            let started = Instant::now();
+            let error = timeout(WATCHDOG, socket.try_read_idle(wait_for_a_byte))
+                .await
+                .expect("a record in flight must arm the bound")
+                .unwrap_err();
+            let elapsed = started.elapsed();
+            let fired_at = Instant::now();
+            assert_timeout(error);
+
+            let last_byte = reads.last().expect("a received byte must be recorded");
+            let from_byte = fired_at.duration_since(last_byte);
+            assert!(
+                from_byte >= BOUND,
+                "the deadline fell before the received byte's bound ({window:?}): {from_byte:?}"
+            );
+            assert!(
+                from_byte < BOUND + Duration::from_millis(500),
+                "the deadline was renewed past the received byte ({window:?}): {from_byte:?}"
+            );
+            match window {
+                EntryWindow::Prefetched => assert!(
+                    elapsed < BOUND * 3 / 4,
+                    "the delayed entry was granted a fresh bound: waited {elapsed:?}"
+                ),
+                EntryWindow::NotPrefetched => assert!(
+                    elapsed >= BOUND,
+                    "the prefix arrived at the entry; one bound from there: waited {elapsed:?}"
+                ),
+            }
+        });
+        let _ = stop.send(());
         server.join().unwrap();
     }
 

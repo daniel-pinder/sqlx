@@ -31,8 +31,18 @@ three patches, until upstream ships them.
   fragments is therefore not a stall; only a whole bound with no byte moved
   poisons. Idle LISTEN waits arm it on the first byte of the message: a
   connection with no byte at all waits indefinitely, while a message that has
-  started arriving must complete within the bound. COPY IN's user data source
-  remains unbounded.
+  started arriving must complete within the bound, and its deadline stays that
+  byte's own `last + bound` even when the wait starts late. A TLS session also
+  tracks record FRAMING over the ciphertext it consumes (never decrypting it),
+  so a record prefix pulled by an earlier read still arms the next idle wait.
+  Only RECEIVE activity arms a read wait; a write may re-anchor a deadline but
+  cannot start a message. COPY IN's user data source remains unbounded.
+  Two exactness limits, both deliberate:
+  - An unfinished TLS record can be shown unfinished, not shown to carry
+    application data — TLS 1.3 ciphertext may decode to handshake or alert
+    traffic — so the conservative predicate is "incomplete incoming record".
+  - "Last transport byte" is the last successful userspace read/write, with
+    executor scheduling tolerance, not the physical network arrival time.
   This does not add cancellation safety for queries dropped by external deadlines.
   DB-free witnesses live in `sqlx-postgres/tests/socket_timeout.rs` and the buffered
   socket's unit tests; both patched crates are in `.fibretel/fork.toml`'s scope.
