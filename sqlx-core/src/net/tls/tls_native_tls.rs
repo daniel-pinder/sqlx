@@ -31,6 +31,10 @@ impl<S: Socket> Socket for NativeTlsSocket<S> {
         self.stream.get_mut().poll_ready(cx)
     }
 
+    fn last_transport_progress(&self) -> Option<std::time::Instant> {
+        self.stream.get_ref().last_transport_progress()
+    }
+
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.stream.shutdown() {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.stream.get_mut().poll_ready(cx),

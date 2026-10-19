@@ -70,6 +70,12 @@ impl<S: Socket> Socket for RustlsSocket<S> {
         self.poll_complete_io(cx)
     }
 
+    fn last_transport_progress(&self) -> Option<std::time::Instant> {
+        // Ciphertext moved by the transport under this TLS session; plaintext
+        // being unavailable does not mean the peer is silent.
+        self.inner.last_transport_progress()
+    }
+
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.close_notify_sent {
             self.state.send_close_notify();

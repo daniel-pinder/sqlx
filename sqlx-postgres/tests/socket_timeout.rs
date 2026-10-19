@@ -500,3 +500,306 @@ fn partial_reads_reset_the_inactivity_timeout() {
     });
     server.join().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// TLS transport-progress witnesses (S1/S2, codex review of the socket patch).
+//
+// The inactivity bound must apply to CIPHERTEXT progress, not to the plaintext
+// a TLS session exposes: a record that arrives in fragments over more than the
+// bound is a peer that is still talking, and a partly arrived record must not
+// leave an idle listener waiting forever. Both witnesses run a scripted rustls
+// SERVER on a loopback socket and drive the real client through a TLS session.
+// ---------------------------------------------------------------------------
+
+mod tls_progress {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    use sqlx_core::connection::ConnectOptions;
+    use sqlx_core::executor::Executor;
+    use sqlx_core::rt::{test_block_on, timeout};
+    use sqlx_postgres::{PgConnectOptions, PgListener, PgPoolOptions, PgSslMode};
+
+    use super::{assert_timeout, BOUND, WATCHDOG};
+
+    const CERT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/certs");
+
+    fn server_config() -> Arc<rustls::ServerConfig> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let certs = CertificateDer::pem_slice_iter(
+            &std::fs::read(format!("{CERT_DIR}/server.crt")).unwrap(),
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(
+            &std::fs::read(format!("{CERT_DIR}/keys/server.key")).unwrap(),
+        )
+        .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        Arc::new(config)
+    }
+
+    /// One scripted Postgres-over-TLS session.
+    struct TlsPeer {
+        conn: rustls::ServerConnection,
+        tcp: TcpStream,
+    }
+
+    impl TlsPeer {
+        fn accept(mut tcp: TcpStream) -> Self {
+            // SSLRequest: length 8, code 80877103; answer `S` and start TLS.
+            let mut request = [0u8; 8];
+            tcp.read_exact(&mut request).unwrap();
+            assert_eq!(&request[4..], &80877103_u32.to_be_bytes());
+            tcp.write_all(b"S").unwrap();
+            let mut conn = rustls::ServerConnection::new(server_config()).unwrap();
+            while conn.is_handshaking() {
+                conn.complete_io(&mut tcp).unwrap();
+            }
+            Self { conn, tcp }
+        }
+
+        fn read_plain(&mut self, buf: &mut [u8]) -> usize {
+            loop {
+                match self.conn.reader().read(buf) {
+                    Ok(read) if read > 0 => return read,
+                    Ok(_) => panic!("client closed the TLS session"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        self.conn.complete_io(&mut self.tcp).unwrap();
+                    }
+                    Err(error) => panic!("TLS read failed: {error}"),
+                }
+            }
+        }
+
+        fn read_exact_plain(&mut self, buf: &mut [u8]) {
+            let mut offset = 0;
+            while offset < buf.len() {
+                offset += self.read_plain(&mut buf[offset..]);
+            }
+        }
+
+        fn read_frame(&mut self) -> (u8, Vec<u8>) {
+            let mut header = [0u8; 5];
+            self.read_exact_plain(&mut header);
+            let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+            let mut body = vec![0; len - 4];
+            self.read_exact_plain(&mut body);
+            (header[0], body)
+        }
+
+        fn startup(&mut self) {
+            let mut len = [0u8; 4];
+            self.read_exact_plain(&mut len);
+            let mut body = vec![0; u32::from_be_bytes(len) as usize - 4];
+            self.read_exact_plain(&mut body);
+            self.write_plain(&[message(b'R', &[0; 4]), message(b'Z', b"I")].concat());
+        }
+
+        fn write_plain(&mut self, plaintext: &[u8]) {
+            self.conn.writer().write_all(plaintext).unwrap();
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut self.tcp).unwrap();
+            }
+        }
+
+        /// Encrypt `plaintext` into the wire bytes of ONE TLS record, without
+        /// sending them: the caller decides how the ciphertext is paced.
+        fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
+            self.conn.writer().write_all(plaintext).unwrap();
+            let mut wire = Vec::new();
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut wire).unwrap();
+            }
+            wire
+        }
+
+        fn tcp(&self) -> TcpStream {
+            self.tcp.try_clone().unwrap()
+        }
+    }
+
+    fn message(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(body.len() + 5);
+        out.push(tag);
+        out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn options(port: u16) -> PgConnectOptions {
+        options_with(port, BOUND)
+    }
+
+    fn options_with(port: u16, bound: Duration) -> PgConnectOptions {
+        PgConnectOptions::new_without_pgpass()
+            .host("127.0.0.1")
+            .port(port)
+            .username("test")
+            .database("test")
+            .ssl_mode(PgSslMode::VerifyCa)
+            .ssl_root_cert(format!("{CERT_DIR}/ca.crt"))
+            .socket_timeout(bound)
+    }
+
+    fn listener(
+        script: impl FnOnce(TlsPeer) + Send + 'static,
+    ) -> (PgConnectOptions, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || script(TlsPeer::accept(listener.accept().unwrap().0)));
+        (options(port), handle)
+    }
+
+    /// S1: a single TLS record whose ciphertext arrives in fragments over more
+    /// than the bound must NOT time out — the transport is making progress, so
+    /// the bound restarts (SO_RCVTIMEO semantics), and the query succeeds.
+    #[test]
+    fn fragmented_tls_record_keeps_the_connection_alive() {
+        let (options, server) = listener(|mut peer| {
+            peer.startup();
+            assert_eq!(peer.read_frame().0, b'Q');
+            // The whole response in ONE record; its ciphertext is dribbled on
+            // the wire over ~400 ms while the client bound is 250 ms.
+            let mut tag = vec![b'x'; 400];
+            tag.push(0);
+            let response = [message(b'C', &tag), message(b'Z', b"I")].concat();
+            let wire = peer.seal(&response);
+            let chunk = std::cmp::max(wire.len().div_ceil(8), 1);
+            let mut tcp = peer.tcp();
+            for piece in wire.chunks(chunk) {
+                tcp.write_all(piece).unwrap();
+                tcp.flush().unwrap();
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        test_block_on(async {
+            let mut connection = options.connect().await.unwrap();
+            timeout(WATCHDOG, connection.execute("SELECT 1"))
+                .await
+                .expect("the bound must not fire while ciphertext keeps arriving")
+                .expect("the fragmented response must be accepted");
+        });
+        server.join().unwrap();
+    }
+
+    /// S2: an idle listener that has received PART of a TLS record must time
+    /// out — transport progress arms the bound even though the plaintext
+    /// buffer is empty. Before the fix this waited forever (the idle path
+    /// disabled the bound on an empty plaintext buffer).
+    #[test]
+    fn partial_tls_record_times_out_on_an_idle_listener() {
+        let (options, server) = listener(|mut peer| {
+            peer.startup();
+            assert_eq!(peer.read_frame().0, b'Q'); // LISTEN
+            peer.write_plain(&[message(b'C', b"LISTEN\0"), message(b'Z', b"I")].concat());
+
+            // Half a notification record, then silence.
+            let notification = message(b'A', &[0, 0, 0, 8, b'c', b'h', b'a', b'n', 0]);
+            let wire = peer.seal(&notification);
+            let mut tcp = peer.tcp();
+            tcp.write_all(&wire[..wire.len() / 2]).unwrap();
+            tcp.flush().unwrap();
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        test_block_on(async {
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(WATCHDOG)
+                .connect_lazy_with(options);
+            let mut listener = PgListener::connect_with(&pool).await.unwrap();
+            listener.listen("chan").await.unwrap();
+            let error = timeout(WATCHDOG, listener.try_recv())
+                .await
+                .expect("a partly arrived record must arm the bound")
+                .expect_err("the partial record must not be deliverable");
+            assert_timeout(error);
+        });
+        server.join().unwrap();
+    }
+
+    /// The bound is EXACT: ciphertext that arrives just after the wait starts
+    /// and then stops must time out one bound after that byte, never after two.
+    /// A restart that hands out a fresh full window would let the silence
+    /// stretch to ~2 x bound.
+    #[test]
+    fn silence_after_progress_times_out_within_one_bound() {
+        const EXACT_BOUND: Duration = Duration::from_millis(400);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut peer = TlsPeer::accept(listener.accept().unwrap().0);
+            peer.startup();
+            assert_eq!(peer.read_frame().0, b'Q');
+            // One byte of ciphertext of the response record, then silence.
+            let wire = peer.seal(&[message(b'C', b"SELECT 1\0"), message(b'Z', b"I")].concat());
+            let mut tcp = peer.tcp();
+            tcp.write_all(&wire[..1]).unwrap();
+            tcp.flush().unwrap();
+            thread::sleep(Duration::from_secs(3));
+        });
+
+        test_block_on(async {
+            let mut connection = options_with(port, EXACT_BOUND).connect().await.unwrap();
+            let started = std::time::Instant::now();
+            let error = timeout(WATCHDOG, connection.execute("SELECT 1"))
+                .await
+                .expect("the bound must fire once the silence exceeds it")
+                .unwrap_err();
+            let elapsed = started.elapsed();
+            assert_timeout(error);
+            assert!(
+                elapsed >= EXACT_BOUND,
+                "fired before the bound: {elapsed:?}"
+            );
+            assert!(
+                elapsed < EXACT_BOUND * 2 - Duration::from_millis(50),
+                "silence reached nearly two bounds: {elapsed:?}"
+            );
+        });
+        server.join().unwrap();
+    }
+
+    /// The other half of S2: an idle listener with NO transport activity at all
+    /// must keep waiting — the bound arms on the first byte, it does not fire
+    /// on a quiet connection.
+    #[test]
+    fn idle_listener_without_transport_activity_keeps_waiting() {
+        let (options, server) = listener(|mut peer| {
+            peer.startup();
+            assert_eq!(peer.read_frame().0, b'Q'); // LISTEN
+            peer.write_plain(&[message(b'C', b"LISTEN\0"), message(b'Z', b"I")].concat());
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        test_block_on(async {
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(WATCHDOG)
+                .connect_lazy_with(options);
+            let mut listener = PgListener::connect_with(&pool).await.unwrap();
+            listener.listen("chan").await.unwrap();
+            let waited = timeout(BOUND * 3, listener.try_recv()).await;
+            assert!(
+                waited.is_err(),
+                "an idle connection with no bytes must not time out"
+            );
+        });
+        server.join().unwrap();
+    }
+}
