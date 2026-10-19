@@ -33,14 +33,6 @@ ignore = [
     # baseline's utoipa-axum ignore; "no safe upgrade is available", and the
     # swap is upstream's.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained, not vulnerable: dev-dependency of the sqlx test suite ((dev) sqlx -> paste 1.0.15), build-time proc-macro only; paste has no upgrade path per the advisory itself, and the swap belongs upstream" },
-    # RUSTSEC-2023-0071 (Marvin Attack: RSA timing side-channel). Path in this
-    # lock: sqlx-mysql -> rsa 0.10.0-rc.19 — the MySQL backend's
-    # caching_sha2_password handshake. FibreTel consumes sqlx-postgres, the
-    # issued line is fixed at =0.9.0 (publish-once), and the advisory carries
-    # patched = [] deliberately: no safe upgrade exists. Provisional accept,
-    # same shape as the jsonwebtoken ignore in billing/fibretel-rs — revisit
-    # when upstream sqlx moves off `rsa`.
-    { id = "RUSTSEC-2023-0071", reason = "MySQL-backend-only path (sqlx-mysql -> rsa 0.10.0-rc.19, caching_sha2_password handshake); FibreTel consumes sqlx-postgres, the version is fixed at =0.9.0, and the advisory has no patched release — provisional accept, revisit when upstream sqlx moves off rsa" },
 ]
 
 [licenses]
