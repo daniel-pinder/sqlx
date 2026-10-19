@@ -76,11 +76,14 @@ serde_json = { version = "1.0.142", optional = true, features = ["raw_value"] }
 [dependencies.sqlx-core]
 workspace = true
 
+[dev-dependencies]
+tokio.workspace = true
+
 [dev-dependencies.sqlx]
 # FIXME: https://github.com/rust-lang/cargo/issues/15622
 # workspace = true
 path = ".."
-features = ["postgres", "derive"]
+features = ["postgres", "derive", "runtime-tokio", "tls-rustls-ring"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 etcetera = "0.11.0"

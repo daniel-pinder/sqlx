@@ -1,10 +1,10 @@
 # sqlx-fibretel
 
 A **bridge fork** of [sqlx](https://github.com/launchbadge/sqlx) carrying
-one patch, until upstream ships it.
+two patches, until upstream ships them.
 
 - **Base:** upstream `v0.9.0` — `75bc0487eb661da811bb7a3c5d158f1bd463fef4`.
-- **The patch:** one commit on top, upstreamable as-is. It bounds two
+- **Pool bounds:** the first patch, upstreamable as-is, bounds two
   waits in `sqlx-core`'s pool that a wedged backend could otherwise park
   forever:
   - the on-release ping — `RELEASE_PING_TIMEOUT` (5 s, matching the
@@ -15,6 +15,19 @@ one patch, until upstream ships it.
     the join is abandoned and the idle drain proceeds on one shared
     deadline, with the abandoned-join accounting saturating so
     `Pool::size()` cannot wrap.
+- **Socket bounds:** `PgConnectOptions::socket_timeout` optionally bounds
+  each socket read, write, flush and shutdown wait, plus a total deadline for
+  connection setup. Expiry returns `Io(TimedOut)` carrying `sqlx::error::SocketTimedOut` and permanently poisons
+  the connection, so the pool discards it. The default is `None` (unchanged).
+  Idle LISTEN waits and COPY IN's user data source remain unbounded.
+  The LISTEN exemption is selected on decoded plaintext, so it is exact for a
+  plaintext socket; under TLS a partial record can still stall an idle listener,
+  because transport progress is not visible outside the TLS layer (residual
+  P2-2: FibreTel's consumers build no `PgListener`, and billing bans it in
+  clippy, so it is documented rather than bound).
+  This does not add cancellation safety for queries dropped by external deadlines.
+  DB-free witnesses live in `sqlx-postgres/tests/socket_timeout.rs` and the buffered
+  socket's unit tests; both patched crates are in `.fibretel/fork.toml`'s scope.
 - **Why a fork:** neither wait is boundable by configuration (measured in
   FibreTel's `billing-1e0j` diagnosis), and with every permit wedged,
   `acquire` fails `PoolTimedOut` for the life of the process.

@@ -18,6 +18,17 @@ pub type Result<T, E = Error> = ::std::result::Result<T, E>;
 // Do not make this type public.
 pub type BoxDynError = Box<dyn StdError + 'static + Send + Sync>;
 
+/// A socket I/O wait exceeded its configured inactivity timeout.
+///
+/// This is carried by [`Error::Io`] with [`io::ErrorKind::TimedOut`]. Unlike a
+/// kernel timeout, it means SQLx has poisoned the connection and will not reuse it.
+#[derive(Debug, thiserror::Error)]
+#[error("socket I/O timed out after {after:?}")]
+pub struct SocketTimedOut {
+    /// The configured timeout that elapsed.
+    pub after: std::time::Duration,
+}
+
 /// An unexpected `NULL` was encountered during decoding.
 ///
 /// Returned from [`Row::get`](crate::row::Row::get) if the value from the database is `NULL`,

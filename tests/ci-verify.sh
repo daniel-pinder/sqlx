@@ -4,7 +4,7 @@
 # declared by the ci-config entry projects/sqlx-fibretel/options.yml).
 #
 # The patch's own suite: sqlx-core under the features its pool tests need.
-# The fork's one patch (the bounded on-release ping and the bounded close()
+# The fork's pool patch (the bounded on-release ping and the bounded close()
 # join, bead billing-1e0j) lives in sqlx-core's pool, and its three tests
 # drive in-memory SQLite — no database server, no network, no fixtures.
 #
@@ -24,3 +24,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 cargo test --locked -p sqlx-core --features _rt-tokio,any,sqlx-toml
+
+# Socket timeout witnesses use scripted loopback peers, not a database. The
+# postgres dev-dependency enables Tokio and rustls/ring (no cmake/libclang).
+# The existing bind_iter doctest imports chrono.
+cargo test --locked -p sqlx-postgres --features chrono

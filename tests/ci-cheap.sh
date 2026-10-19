@@ -5,19 +5,19 @@
 #
 # WHAT THIS SCRIPT IS FOR NOW. The archetype lane owns the fork's gate
 # (Daniel's 2026-10-11 fork-CI ruling, implemented by ci-templates !373 +
-# ci-config !170): with `fork-patched-crates: sqlx-core` the lane runs
-# `cargo fmt --all --check`, `cargo clippy --all-targets --locked -p sqlx-core
-# -- -D warnings -D unsafe_code`, and `cargo check --workspace --all-targets
+# ci-config !170): with `fork-patched-crates: sqlx-core sqlx-postgres`
+# the lane runs `cargo fmt --all --check`, clippy on both patched crates
+# with `-D warnings -D unsafe_code`, and `cargo check --workspace --all-targets
 # --locked` — lint what we own, compile what we vendor. This script no longer
 # repeats any of that. What it keeps is the one dimension the lane cannot
 # express:
 #
 # THE FEATURE-SCOPED LINT. The lane's clippy runs at default features — the
 # template refuses a features input (eg0u.2: no conditional, no argv
-# injection) — but the patch's subject is the runtime pool (commit ecbfc25d:
-# the bounded on-release ping and the bounded close() join), whose code and
-# tests compile under `_rt-tokio`. So the feature-scoped lint of the patched
-# crate lives here, where a feature set can be named.
+# injection) — but the pool and socket timeout witnesses run under Tokio.
+# The feature-scoped lint of both patched crates lives here, where a feature
+# set can be named. The postgres test graph also enables rustls/ring for the
+# silent SSL negotiation witness.
 #
 # `--no-deps` is measured, not assumed: trailing `--` flags and clippy's
 # wrapper reach workspace-member DEPENDENCIES, so a bare `-p sqlx-core`
@@ -44,5 +44,5 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo clippy --locked --all-targets -p sqlx-core --features _rt-tokio --no-deps \
+cargo clippy --locked --all-targets -p sqlx-core -p sqlx-postgres --features _rt-tokio --no-deps \
     -- -D warnings -D unsafe_code
