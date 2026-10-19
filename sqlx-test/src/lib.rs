@@ -17,7 +17,7 @@ where
 
     let db_url = env::var("DATABASE_URL").map_err(|e| Error::Configuration(Box::new(e)))?;
 
-    DB::Connection::connect(&db_url).await
+    Ok(DB::Connection::connect(&db_url).await?)
 }
 
 // Make a new pool

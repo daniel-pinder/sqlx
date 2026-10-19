@@ -70,11 +70,21 @@ repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-# The fork's gate scripts live under tests/ as repo furniture and are NOT
-# part of upstream's v0.9.0 archive; publish-once means they cannot be
-# removed from a .crate after the fact. Proven absent with
-# `cargo package -p sqlx --list`.
-exclude = ["tests/ci-*.sh"]
+# FORK FURNITURE NEVER SHIPS. The archive must be upstream package content
+# plus the patched bytes; publish-once means a leaked file can never be
+# retracted. The gate scripts were the first leak (af26c72f); this applies the
+# same standard to every path the fork adds to the package root:
+# `cargo package -p sqlx --list` against upstream's own sqlx-0.9.0 archive is
+# the check, and each entry below is absent from that archive.
+exclude = [
+    "tests/ci-*.sh",  # the two gate hooks
+    "release-crate",  # the publisher's one-line crate marker
+    ".cargo",         # the fleet registry/index wiring
+    ".fibretel",      # the fork declaration (patch scope)
+    "AGENTS.md",      # agent docs (CLAUDE.md's symlink twin)
+    "CLAUDE.md",
+    "deny.toml",      # the fleet supply-chain policy
+]
 
 # Note: written so that it may be copy-pasted to other crates
 [package.metadata.docs.rs]
