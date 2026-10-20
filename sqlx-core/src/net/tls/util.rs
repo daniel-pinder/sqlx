@@ -13,10 +13,6 @@ pub struct StdSocket<S> {
     /// record arriving in fragments moves this instant while the plaintext
     /// buffer stays empty.
     last_transport_progress: Option<std::time::Instant>,
-    /// When ciphertext was last READ. Receive activity is the only evidence
-    /// that an incoming message started arriving; a write must not arm a
-    /// read wait.
-    last_receive_progress: Option<std::time::Instant>,
     /// TLS record framing over the ciphertext consumed so far, so a prefix of
     /// a record pulled by a previous read is still visible to the next wait.
     records: RecordFramer,
@@ -70,7 +66,6 @@ impl<S: Socket> StdSocket<S> {
             wants_read: false,
             wants_write: false,
             last_transport_progress: None,
-            last_receive_progress: None,
             records: RecordFramer::default(),
         }
     }
@@ -113,11 +108,6 @@ impl<S: Socket> StdSocket<S> {
         self.last_transport_progress
     }
 
-    /// When ciphertext was last received, if ever.
-    pub fn last_receive_progress(&self) -> Option<std::time::Instant> {
-        self.last_receive_progress
-    }
-
     /// Whether the ciphertext consumed so far ends inside a TLS record.
     pub fn has_incomplete_incoming_record(&self) -> bool {
         self.records.is_incomplete()
@@ -133,9 +123,7 @@ impl<S: Socket> Read for StdSocket<S> {
         let read = self.socket.try_read(&mut &mut *buf)?;
         self.wants_read = false;
         if read > 0 {
-            let now = std::time::Instant::now();
-            self.last_transport_progress = Some(now);
-            self.last_receive_progress = Some(now);
+            self.last_transport_progress = Some(std::time::Instant::now());
             self.records.observe(&buf[..read]);
         }
 

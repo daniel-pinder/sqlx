@@ -17,8 +17,6 @@ use crate::net::Socket;
 pub struct TrackedTcpStream {
     inner: TcpStream,
     last: Option<Instant>,
-    /// When a byte was last RECEIVED (never written).
-    last_received: Option<Instant>,
 }
 
 impl TrackedTcpStream {
@@ -26,7 +24,6 @@ impl TrackedTcpStream {
         Self {
             inner,
             last: None,
-            last_received: None,
         }
     }
 }
@@ -36,9 +33,7 @@ impl Socket for TrackedTcpStream {
         // Requires `&mut impl BufMut`
         let read = self.inner.try_read_buf(&mut buf)?;
         if read > 0 {
-            let now = Instant::now();
-            self.last = Some(now);
-            self.last_received = Some(now);
+            self.last = Some(Instant::now());
         }
         Ok(read)
     }
@@ -65,10 +60,6 @@ impl Socket for TrackedTcpStream {
 
     fn last_transport_progress(&self) -> Option<Instant> {
         self.last
-    }
-
-    fn last_receive_progress(&self) -> Option<Instant> {
-        self.last_received
     }
 
     fn has_incomplete_incoming_record(&self) -> bool {
@@ -83,8 +74,6 @@ impl Socket for TrackedTcpStream {
 pub struct TrackedUnixStream {
     inner: tokio::net::UnixStream,
     last: Option<Instant>,
-    /// When a byte was last RECEIVED (never written).
-    last_received: Option<Instant>,
 }
 
 #[cfg(unix)]
@@ -93,7 +82,6 @@ impl TrackedUnixStream {
         Self {
             inner,
             last: None,
-            last_received: None,
         }
     }
 }
@@ -103,9 +91,7 @@ impl Socket for TrackedUnixStream {
     fn try_read(&mut self, mut buf: &mut dyn ReadBuf) -> io::Result<usize> {
         let read = self.inner.try_read_buf(&mut buf)?;
         if read > 0 {
-            let now = Instant::now();
-            self.last = Some(now);
-            self.last_received = Some(now);
+            self.last = Some(Instant::now());
         }
         Ok(read)
     }
@@ -132,10 +118,6 @@ impl Socket for TrackedUnixStream {
 
     fn last_transport_progress(&self) -> Option<Instant> {
         self.last
-    }
-
-    fn last_receive_progress(&self) -> Option<Instant> {
-        self.last_received
     }
 
     fn has_incomplete_incoming_record(&self) -> bool {

@@ -689,9 +689,6 @@ mod tests {
             // Nothing ever moves on this mock; a wait on it can only time out.
             None
         }
-        fn last_receive_progress(&self) -> Option<std::time::Instant> {
-            None
-        }
         fn has_incomplete_incoming_record(&self) -> bool {
             false
         }

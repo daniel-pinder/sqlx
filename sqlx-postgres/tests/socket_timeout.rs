@@ -738,10 +738,6 @@ mod tls_progress {
             self.inner.last_transport_progress()
         }
 
-        fn last_receive_progress(&self) -> Option<Instant> {
-            self.inner.last_receive_progress()
-        }
-
         fn has_incomplete_incoming_record(&self) -> bool {
             // Record framing above this transport is what can be part-way
             // through; a raw socket has no framing of its own.
@@ -1217,9 +1213,15 @@ mod tls_progress {
                 .expect_err("a handshake paced past the setup deadline must not connect");
             let elapsed = started.elapsed();
             assert_timeout(error);
+            // The DISCRIMINATOR: with the fix, negotiation runs inside the
+            // setup deadline and connect fails AT the bound; a premature
+            // handshake return lets the paced flight finish on later buffered
+            // flushes (codex measured ~918 ms with this 250 ms bound). Half a
+            // bound of slack keeps a loaded host from failing the fix.
             assert!(
-                elapsed < WATCHDOG / 2,
-                "connect returned after {elapsed:?}; negotiation escaped the setup deadline"
+                elapsed < BOUND + BOUND / 2,
+                "connect returned after {elapsed:?}; negotiation escaped the setup \
+                 deadline (the fix fails setup at ~{BOUND:?})"
             );
         });
         server.join().unwrap();

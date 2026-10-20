@@ -348,9 +348,18 @@ impl PgConnectOptions {
 
     /// Set the inactivity timeout for each socket read, write, flush and shutdown wait.
     ///
+    /// The bound applies to SILENCE: every byte that moves on the wire restarts
+    /// it, in either direction. A write or flush that a peer stops reading while
+    /// it is still sending (a server streaming a large result into a blocked
+    /// Bind, for instance) is therefore extended by that inbound activity, so
+    /// this is not a deadline for a slow-but-progressing transfer in either
+    /// direction.
+    ///
     /// Also applies one total deadline to connection setup (DNS, TCP and TLS negotiation).
     /// If it elapses, the connection returns an I/O error of kind `TimedOut` carrying
-    /// [`sqlx_core::error::SocketTimedOut`] and cannot be reused.
+    /// [`sqlx_core::error::SocketTimedOut`] and cannot be reused. Setup is
+    /// abandoned wherever it stands: the peer sees an abrupt close, with no TLS
+    /// `close_notify`.
     ///
     /// Defaults to `None` (unbounded). Choose a value above server-side statement
     /// and transaction timeouts. Idle notification waits and COPY IN's user-provided
