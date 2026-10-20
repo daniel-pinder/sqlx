@@ -573,7 +573,7 @@ mod tls_progress {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::ops::ControlFlow;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1286,6 +1286,205 @@ mod tls_progress {
                  deadline (the fix fails setup at ~{BOUND:?})"
             );
         });
+        server.join().unwrap();
+    }
+
+    /// Accepts everything until `flight_sent` is raised, then lets at most
+    /// `budget` further bytes cross and reports write-blocked forever after.
+    /// Reads and read readiness pass through untouched.
+    struct BlockFinalFlight<S> {
+        inner: S,
+        flight_sent: Arc<AtomicBool>,
+        budget: usize,
+    }
+
+    impl<S: Socket> Socket for BlockFinalFlight<S> {
+        fn try_read(&mut self, buf: &mut dyn sqlx_core::io::ReadBuf) -> std::io::Result<usize> {
+            self.inner.try_read(buf)
+        }
+
+        fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.flight_sent.load(Ordering::SeqCst) {
+                if self.budget == 0 {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                let allowed = std::cmp::min(self.budget, buf.len());
+                let written = self.inner.try_write(&buf[..allowed])?;
+                self.budget -= written;
+                return Ok(written);
+            }
+            self.inner.try_write(buf)
+        }
+
+        fn poll_read_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.inner.poll_read_ready(cx)
+        }
+
+        fn poll_write_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.flight_sent.load(Ordering::SeqCst) && self.budget == 0 {
+                // The final flight is stuck by construction: never ready,
+                // never woken. Only the setup deadline can end this.
+                return std::task::Poll::Pending;
+            }
+            self.inner.poll_write_ready(cx)
+        }
+
+        fn poll_shutdown(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.inner.poll_shutdown(cx)
+        }
+
+        fn last_transport_progress(&self) -> Option<Instant> {
+            self.inner.last_transport_progress()
+        }
+
+        fn last_send_progress(&self) -> Option<Instant> {
+            self.inner.last_send_progress()
+        }
+
+        fn has_incomplete_incoming_record(&self) -> bool {
+            self.inner.has_incomplete_incoming_record()
+        }
+    }
+
+    /// The production upgrade path — SSLRequest, then `tls::handshake` — over
+    /// a socket that blocks the client's FINAL handshake flight: once the
+    /// scripted peer has raised `flight_sent` (it has written its own flight),
+    /// at most four further client bytes are permitted.
+    struct BlockedFinalFlightUpgrade {
+        ca: CertificateInput,
+        flight_sent: Arc<AtomicBool>,
+    }
+
+    impl WithSocket for BlockedFinalFlightUpgrade {
+        type Output = sqlx_core::Result<Box<dyn Socket>>;
+
+        async fn with_socket<S: Socket>(self, socket: S) -> Self::Output {
+            let mut socket = BlockFinalFlight {
+                inner: socket,
+                flight_sent: self.flight_sent,
+                budget: 4,
+            };
+
+            // SSLRequest: length 8, code 80877103; the scripted peer answers
+            // `S` and starts TLS.
+            socket.write(&[0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F]).await?;
+            socket.flush().await?;
+            let mut answer = [0u8; 1];
+            {
+                let mut target: &mut [u8] = &mut answer;
+                socket.read(&mut target).await?;
+            }
+            assert_eq!(&answer, b"S", "the scripted peer must accept TLS");
+
+            let config = TlsConfig {
+                accept_invalid_certs: false,
+                accept_invalid_hostnames: true,
+                hostname: "127.0.0.1",
+                root_cert_path: Some(&self.ca),
+                client_cert_path: None,
+                client_key_path: None,
+            };
+
+            tls::handshake(socket, config, SocketIntoBox).await
+        }
+    }
+
+    /// Codex P2 (second look on 93e469ab): rustls can clear
+    /// `is_handshaking()` while the client's FINAL handshake flight is still
+    /// queued. A partial write then lets `complete_io()` return successfully,
+    /// setup reports success at ~192 ms, and the rest of the flight is
+    /// written by the first query's flush — which times out at ~443 ms with a
+    /// 250 ms bound, OUTSIDE the setup deadline. Native-tls stayed inside
+    /// setup (~254 ms), which is the semantics this witness restores.
+    ///
+    /// The peer holds its own flight for three quarters of the bound, then
+    /// raises `flight_sent` and lets at most FOUR further client bytes cross
+    /// before blocking writes forever. Setup must stay inside its deadline
+    /// until the queued handshake output drains: the deadline, not a later
+    /// flush, is what ends this connection.
+    #[test]
+    fn a_blocked_final_handshake_flight_cannot_escape_the_setup_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let flight_sent = Arc::new(AtomicBool::new(false));
+        let peer_sent = flight_sent.clone();
+        let server = thread::spawn(move || {
+            let mut tcp = listener.accept().unwrap().0;
+            let mut request = [0u8; 8];
+            tcp.read_exact(&mut request).unwrap();
+            assert_eq!(&request[4..], &80877103_u32.to_be_bytes());
+            tcp.write_all(b"S").unwrap();
+            tcp.flush().unwrap();
+
+            // Hold the ClientHello unanswered for three quarters of the
+            // bound, then send the server flight.
+            thread::sleep(BOUND * 3 / 4);
+            let mut conn = rustls::ServerConnection::new(server_config()).unwrap();
+            loop {
+                match conn.read_tls(&mut tcp) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => return,
+                }
+                if conn.process_new_packets().is_err() {
+                    return;
+                }
+                if conn.wants_write() {
+                    // Raised BEFORE the bytes leave: the client cannot write
+                    // its final flight until it has processed this one, so
+                    // the injection covers exactly that flight.
+                    peer_sent.store(true, Ordering::SeqCst);
+                    while conn.wants_write() {
+                        if conn.write_tls(&mut tcp).is_err() {
+                            return;
+                        }
+                    }
+                    break;
+                }
+            }
+            // Keep the connection OPEN and silent: a close would look like
+            // EOF, not like the write backpressure under test.
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        let outcome = test_block_on(async {
+            let ca = CertificateInput::File(format!("{CERT_DIR}/ca.crt").into());
+            let started = Instant::now();
+            let outcome = timeout(
+                BOUND,
+                connect_tcp(
+                    "127.0.0.1",
+                    port,
+                    BlockedFinalFlightUpgrade { ca, flight_sent },
+                ),
+            )
+            .await;
+            (started.elapsed(), outcome)
+        });
+        let (elapsed, outcome) = outcome;
+        match outcome {
+            Ok(Ok(_)) => panic!(
+                "TLS setup reported success at {elapsed:?} while the final handshake \
+                 flight was still blocked; negotiation escaped the setup deadline"
+            ),
+            Ok(Err(error)) => {
+                panic!("the handshake surfaced a non-deadline error at {elapsed:?}: {error:?}")
+            }
+            Err(_) => assert!(
+                elapsed < BOUND + BOUND / 2,
+                "the setup deadline fired at {elapsed:?}, after the bound"
+            ),
+        }
         server.join().unwrap();
     }
 

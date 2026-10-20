@@ -208,15 +208,22 @@ where
     };
 
     // Performs the TLS handshake or bails. rustls's `complete_io` can return
-    // once there is no I/O it can do RIGHT NOW while the connection still
-    // reports `is_handshaking` (TLS 1.3 may leave a flight outstanding); the
-    // native-tls backend loops until its handshake is final, so a rustls
-    // session used to finish negotiation on the first query instead — outside
-    // the setup deadline (codex P2). Wait for the handshake to actually
-    // finish here, bounded by the same outer future the caller applies to
-    // setup.
+    // once there is no I/O it can do RIGHT NOW while the handshake is still
+    // unfinished in TWO different senses, and both must be waited out here,
+    // bounded by the same outer future the caller applies to setup:
+    //
+    // - `is_handshaking()` may still be true (TLS 1.3 may leave a flight
+    //   outstanding);
+    // - `is_handshaking()` may already be FALSE while the client's FINAL
+    //   handshake output is still queued: a partial write makes `complete_io`
+    //   return successfully before that output drains. Returning here would
+    //   report setup success and leave the rest of negotiation to the first
+    //   query's flush — outside the setup deadline (codex P2, second look).
+    //
+    // The native-tls backend loops until its handshake is final in both
+    // senses, so this keeps the two backends' setup semantics aligned.
     socket.complete_io().await?;
-    while socket.state.is_handshaking() {
+    while socket.state.is_handshaking() || socket.state.wants_write() {
         socket.inner.ready().await?;
         socket.complete_io().await?;
     }

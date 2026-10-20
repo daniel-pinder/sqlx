@@ -42,6 +42,10 @@ witnesses=(
     # ...and a blocked TLS outbound wait is not extended by inbound
     # ciphertext, even though the session reads it while the window is full.
     tls_progress::inbound_ciphertext_does_not_extend_a_blocked_outbound_flush
+    # A partially written FINAL handshake flight cannot let setup report
+    # success: rustls clears is_handshaking() while output is still queued
+    # (codex P2, second look), on this reactor exactly as on tokio.
+    tls_progress::a_blocked_final_handshake_flight_cannot_escape_the_setup_deadline
 )
 
 for witness in "${witnesses[@]}"; do
