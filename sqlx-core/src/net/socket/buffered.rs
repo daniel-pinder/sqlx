@@ -189,10 +189,9 @@ impl<S: Socket> BufferedSocket<S> {
     pub async fn flush(&mut self) -> io::Result<()> {
         self.check_poisoned()?;
         while !self.write_buf.is_empty() {
-            let mut bound =
-                WaitBound::new(self.io_timeout, self.socket.last_transport_progress());
+            let mut bound = WaitBound::new(self.io_timeout, self.socket.last_send_progress());
             let written = loop {
-                let before = self.socket.last_transport_progress();
+                let before = self.socket.last_send_progress();
                 match io_timeout_bound(bound.window(), self.io_timeout, async {
                     self.socket.write(self.write_buf.get()).await
                 })
@@ -213,10 +212,9 @@ impl<S: Socket> BufferedSocket<S> {
             self.write_buf.sanity_check();
         }
 
-        let mut bound =
-            WaitBound::new(self.io_timeout, self.socket.last_transport_progress());
+        let mut bound = WaitBound::new(self.io_timeout, self.socket.last_send_progress());
         loop {
-            let before = self.socket.last_transport_progress();
+            let before = self.socket.last_send_progress();
             match io_timeout_bound(bound.window(), self.io_timeout, async {
                 self.socket.flush().await
             })
@@ -236,10 +234,9 @@ impl<S: Socket> BufferedSocket<S> {
     pub async fn shutdown(&mut self) -> io::Result<()> {
         self.check_poisoned()?;
         self.flush().await?;
-        let mut bound =
-            WaitBound::new(self.io_timeout, self.socket.last_transport_progress());
+        let mut bound = WaitBound::new(self.io_timeout, self.socket.last_send_progress());
         loop {
-            let before = self.socket.last_transport_progress();
+            let before = self.socket.last_send_progress();
             match io_timeout_bound(bound.window(), self.io_timeout, async {
                 self.socket.shutdown().await
             })
@@ -440,8 +437,8 @@ impl ReadBuffer {
                             // complete control record moves ciphertext,
                             // starts no message, and retires an arm a
                             // fragment of the same record may have set.
-                            let in_flight = !self.read.is_empty()
-                                || socket.has_incomplete_incoming_record();
+                            let in_flight =
+                                !self.read.is_empty() || socket.has_incomplete_incoming_record();
                             bound.activity(last, in_flight);
                             continue;
                         }
@@ -509,15 +506,22 @@ impl ReadBuffer {
 }
 
 /// The inactivity bound for one wait, shared by the read, write, flush and
-/// shutdown paths so the rule is identical in every direction.
+/// shutdown paths. The RULE is identical everywhere: the deadline is
+/// `last PROGRESS BYTE + bound`, recomputed on every loop iteration, and every
+/// byte that counts buys one full bound from ITS instant. What counts is
+/// direction-scoped, because inbound and outbound stalls are different
+/// failures:
 ///
-/// The deadline is `last transport byte + bound`, recomputed on every loop
-/// iteration: every byte that moves on the wire — a successful partial read or
-/// write as much as a fragmented TLS record — buys one full bound from ITS
-/// instant. A wait that begins after a quiet period is anchored to its own
-/// start, so a fresh operation is never cut short by an old timestamp, and a
-/// wait may restart without a bound only while it is idle and no byte of the
-/// current message has arrived.
+/// - a RECEIVE wait counts transport progress in either direction — any byte
+///   the transport moved (including a handshake flight the session wrote
+///   while reading) shows the connection is not stalled;
+/// - an OUTGOING wait counts OUTBOUND progress only — a peer that keeps
+///   talking while never draining our send buffer must still hit the bound.
+///
+/// A wait that begins after a quiet period is anchored to its own start when
+/// nothing in its direction has moved, so a fresh operation is never cut short
+/// by an old timestamp, and a receive wait may restart without a bound only
+/// while it is idle and no byte of the current message has arrived.
 struct WaitBound {
     bound: Option<Duration>,
     anchor: Instant,
@@ -526,9 +530,10 @@ struct WaitBound {
 
 impl WaitBound {
     /// An OUTGOING wait (write, flush, shutdown), where there is no partially
-    /// received input to account for: the deadline restarts from this wait's
-    /// own entry, so an old transport timestamp cannot cut a fresh operation
-    /// short.
+    /// received input to account for. `last` is the last OUTBOUND byte
+    /// ([`Socket::last_send_progress`]); the deadline restarts from this
+    /// wait's own entry when nothing outbound moved recently, and a stale
+    /// inbound timestamp can never cut a fresh operation short or extend it.
     fn new(bound: Option<Duration>, last: Option<Instant>) -> Self {
         let entry = Instant::now();
         let anchor = last.map_or(entry, |last| std::cmp::max(last, entry));
@@ -583,14 +588,17 @@ impl WaitBound {
     }
 }
 
-/// Re-anchor an OUTGOING wait on transport progress observed at its timeout:
-/// `true` means retry the wait, `false` means the timeout was real.
+/// Re-anchor an OUTGOING wait on OUTBOUND transport progress observed at its
+/// timeout: `true` means retry the wait, `false` means the timeout was real.
+/// Inbound bytes never extend an outgoing wait, on any transport: a peer that
+/// keeps talking while never draining our send buffer is exactly the stall the
+/// bound exists to catch.
 fn retry_outgoing_on_progress<S: Socket>(
     socket: &mut S,
     bound: &mut WaitBound,
     before: Option<Instant>,
 ) -> bool {
-    match socket.last_transport_progress() {
+    match socket.last_send_progress() {
         Some(last) if Some(last) != before => {
             bound.progress(last, true);
             true
@@ -687,6 +695,9 @@ mod tests {
         }
         fn last_transport_progress(&self) -> Option<std::time::Instant> {
             // Nothing ever moves on this mock; a wait on it can only time out.
+            None
+        }
+        fn last_send_progress(&self) -> Option<std::time::Instant> {
             None
         }
         fn has_incomplete_incoming_record(&self) -> bool {

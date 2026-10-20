@@ -24,11 +24,15 @@ three patches, until upstream ships them.
   each socket read, write, flush and shutdown wait, plus a total deadline for
   connection setup. Expiry returns `Io(TimedOut)` carrying `sqlx::error::SocketTimedOut` and permanently poisons
   the connection, so the pool discards it. The default is `None` (unchanged).
-  The bound follows TRANSPORT progress: every transport — plain TCP or UDS as
-  well as TLS — records the instant of the last byte it moved in either
-  direction, and every wait (read, write, flush, shutdown) is anchored to it
-  (`last + bound`, recomputed each iteration). A record or message arriving in
-  fragments is therefore not a stall; only a whole bound with no byte moved
+  The bound follows TRANSPORT progress in the wait's own direction. Every
+  transport — plain TCP or UDS as well as TLS — records two instants: the last
+  byte it moved in either direction, and the last byte it moved OUTBOUND. A
+  receive wait is anchored to the former (`last + bound`, recomputed each
+  iteration), so a record or message arriving in fragments is not a stall;
+  an outgoing wait (write, flush, shutdown) is anchored to the latter only,
+  on every backend, so a peer that keeps talking while never draining our
+  send buffer still trips the bound one interval after our last byte was
+  accepted. Only a whole bound with no progress in the wait's direction
   poisons. Idle LISTEN waits arm it on the first byte of the message: a
   connection with no byte at all waits indefinitely, while a message that has
   started arriving must complete within the bound, and its deadline stays that

@@ -31,15 +31,40 @@ pub trait Socket: Send + Sync + Unpin + 'static {
     /// When this socket last moved a byte in EITHER direction, `None` before
     /// the first one.
     ///
-    /// REQUIRED on purpose. [`BufferedSocket`] anchors its inactivity deadline
-    /// to this instant (`last + bound`) and exempts only a wait that has seen
-    /// no byte of the current message; a socket that cannot answer this cannot
-    /// tell a fragmented message in flight from a stalled peer. Every
-    /// transport in the tree — the raw TCP/UDS sockets (which record on
-    /// `try_read`/`try_write`) and the TLS sessions above them — implements
-    /// it, and a new transport has to make that decision instead of
-    /// inheriting a silent default.
+    /// This is the RECEIVE side's liveness signal. [`BufferedSocket`] anchors
+    /// a read wait to this instant (`last + bound`) and exempts only a wait
+    /// that has seen no byte of the current message; a socket that cannot
+    /// answer this cannot tell a fragmented message in flight from a stalled
+    /// peer. Any byte the transport moved counts — plaintext arriving in
+    /// fragments, a TLS control record, even a handshake flight the session
+    /// wrote while reading — because every one of them shows the connection
+    /// is not stalled.
+    ///
+    /// OUTGOING waits (write, flush, shutdown) anchor to
+    /// [`last_send_progress`](Self::last_send_progress) instead: an inbound
+    /// byte is not evidence that our outbound write is getting anywhere.
+    ///
+    /// REQUIRED on purpose. Every transport in the tree — the raw TCP/UDS
+    /// sockets (which record on `try_read`/`try_write`) and the TLS sessions
+    /// above them — implements it, and a new transport has to make that
+    /// decision instead of inheriting a silent default.
     fn last_transport_progress(&self) -> Option<std::time::Instant>;
+
+    /// When this socket last moved a byte OUTBOUND — the transport accepted
+    /// bytes from us — `None` before the first one.
+    ///
+    /// This is the OUTGOING side's progress signal. A write, flush or
+    /// shutdown wait restarts from this instant and only this one: a peer
+    /// that keeps talking while never draining its receive buffer is exactly
+    /// the stall the outbound bound exists to catch, and counting its inbound
+    /// bytes as send progress would let it hold a blocked write open
+    /// indefinitely. For TLS this is CIPHERTEXT accepted by the transport
+    /// under the session, not plaintext accepted into the session's send
+    /// buffer — accepting plaintext costs nothing on the wire.
+    ///
+    /// REQUIRED on purpose: a transport that inherited a default would
+    /// silently answer one direction with the other's instant.
+    fn last_send_progress(&self) -> Option<std::time::Instant>;
 
     /// Whether this transport is holding a PREFIX OF AN INCOMPLETE incoming
     /// record that it has already consumed from the wire.
@@ -214,6 +239,10 @@ impl<S: Socket + ?Sized> Socket for Box<S> {
 
     fn last_transport_progress(&self) -> Option<std::time::Instant> {
         (**self).last_transport_progress()
+    }
+
+    fn last_send_progress(&self) -> Option<std::time::Instant> {
+        (**self).last_send_progress()
     }
 
     fn has_incomplete_incoming_record(&self) -> bool {

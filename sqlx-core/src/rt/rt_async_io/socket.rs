@@ -15,6 +15,7 @@ use crate::io::ReadBuf;
 pub struct TrackedTcpStream {
     inner: Async<TcpStream>,
     last: Option<Instant>,
+    last_send: Option<Instant>,
 }
 
 impl TrackedTcpStream {
@@ -22,6 +23,7 @@ impl TrackedTcpStream {
         Self {
             inner,
             last: None,
+            last_send: None,
         }
     }
 }
@@ -38,7 +40,9 @@ impl Socket for TrackedTcpStream {
     fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.inner.get_ref().write(buf)?;
         if written > 0 {
-            self.last = Some(Instant::now());
+            let now = Instant::now();
+            self.last = Some(now);
+            self.last_send = Some(now);
         }
         Ok(written)
     }
@@ -59,6 +63,10 @@ impl Socket for TrackedTcpStream {
         self.last
     }
 
+    fn last_send_progress(&self) -> Option<Instant> {
+        self.last_send
+    }
+
     fn has_incomplete_incoming_record(&self) -> bool {
         // A plaintext transport has no record framing to be part-way through.
         false
@@ -71,6 +79,7 @@ impl Socket for TrackedTcpStream {
 pub struct TrackedUnixStream {
     inner: Async<std::os::unix::net::UnixStream>,
     last: Option<Instant>,
+    last_send: Option<Instant>,
 }
 
 #[cfg(unix)]
@@ -79,6 +88,7 @@ impl TrackedUnixStream {
         Self {
             inner,
             last: None,
+            last_send: None,
         }
     }
 }
@@ -96,7 +106,9 @@ impl Socket for TrackedUnixStream {
     fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.inner.get_ref().write(buf)?;
         if written > 0 {
-            self.last = Some(Instant::now());
+            let now = Instant::now();
+            self.last = Some(now);
+            self.last_send = Some(now);
         }
         Ok(written)
     }
@@ -115,6 +127,10 @@ impl Socket for TrackedUnixStream {
 
     fn last_transport_progress(&self) -> Option<Instant> {
         self.last
+    }
+
+    fn last_send_progress(&self) -> Option<Instant> {
+        self.last_send
     }
 
     fn has_incomplete_incoming_record(&self) -> bool {

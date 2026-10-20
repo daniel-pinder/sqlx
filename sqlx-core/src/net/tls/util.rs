@@ -9,10 +9,14 @@ pub struct StdSocket<S> {
     wants_read: bool,
     wants_write: bool,
     /// When ciphertext was last read from or written to `socket`. This is the
-    /// transport-progress signal the inactivity bound is anchored to: a TLS
-    /// record arriving in fragments moves this instant while the plaintext
-    /// buffer stays empty.
+    /// transport-progress signal a RECEIVE wait is anchored to: a TLS record
+    /// arriving in fragments moves this instant while the plaintext buffer
+    /// stays empty.
     last_transport_progress: Option<std::time::Instant>,
+    /// When ciphertext was last WRITTEN to `socket`. An OUTGOING wait anchors
+    /// to this and nothing else: ciphertext arriving from the peer says
+    /// nothing about whether our own write is being drained.
+    last_send_progress: Option<std::time::Instant>,
     /// TLS record framing over the ciphertext consumed so far, so a prefix of
     /// a record pulled by a previous read is still visible to the next wait.
     records: RecordFramer,
@@ -66,6 +70,7 @@ impl<S: Socket> StdSocket<S> {
             wants_read: false,
             wants_write: false,
             last_transport_progress: None,
+            last_send_progress: None,
             records: RecordFramer::default(),
         }
     }
@@ -103,9 +108,14 @@ impl<S: Socket> StdSocket<S> {
         future::poll_fn(|cx| self.poll_ready(cx)).await
     }
 
-    /// When ciphertext was last moved, if ever.
+    /// When ciphertext was last moved in either direction, if ever.
     pub fn last_transport_progress(&self) -> Option<std::time::Instant> {
         self.last_transport_progress
+    }
+
+    /// When ciphertext was last moved OUTBOUND, if ever.
+    pub fn last_send_progress(&self) -> Option<std::time::Instant> {
+        self.last_send_progress
     }
 
     /// Whether the ciphertext consumed so far ends inside a TLS record.
@@ -137,7 +147,9 @@ impl<S: Socket> Write for StdSocket<S> {
         let written = self.socket.try_write(buf)?;
         self.wants_write = false;
         if written > 0 {
-            self.last_transport_progress = Some(std::time::Instant::now());
+            let now = std::time::Instant::now();
+            self.last_transport_progress = Some(now);
+            self.last_send_progress = Some(now);
         }
         Ok(written)
     }

@@ -348,12 +348,16 @@ impl PgConnectOptions {
 
     /// Set the inactivity timeout for each socket read, write, flush and shutdown wait.
     ///
-    /// The bound applies to SILENCE: every byte that moves on the wire restarts
-    /// it, in either direction. A write or flush that a peer stops reading while
-    /// it is still sending (a server streaming a large result into a blocked
-    /// Bind, for instance) is therefore extended by that inbound activity, so
-    /// this is not a deadline for a slow-but-progressing transfer in either
-    /// direction.
+    /// The bound applies to progress in the wait's OWN direction. A receive
+    /// wait restarts on transport progress in either direction: every byte that
+    /// moves on the wire — plaintext, a fragmented TLS record, a control record
+    /// — restarts it. An outgoing wait (write, flush, shutdown) restarts on
+    /// OUTBOUND progress only, and this is true on every transport and TLS
+    /// backend alike: bytes arriving from the peer never extend it. A peer that
+    /// stops reading while it is still sending (a server streaming a large
+    /// result into a blocked Bind, for instance) therefore trips the bound one
+    /// interval after our last byte was accepted, so this bounds a peer that
+    /// has stopped draining us as well as one that has gone silent.
     ///
     /// Also applies one total deadline to connection setup (DNS, TCP and TLS negotiation).
     /// If it elapses, the connection returns an I/O error of kind `TimedOut` carrying

@@ -195,6 +195,64 @@ fn filled_write_window_times_out_during_copy_send() {
     server.join().unwrap();
 }
 
+/// billing-7t7r P2 (grok): the plaintext backend's outgoing waits count
+/// OUTBOUND progress only. A peer that stops reading a COPY send while
+/// streaming bytes back must not hold the blocked flush open: it fires one
+/// bound after the last byte the kernel accepted from us. (Plaintext never
+/// read during a write, so this was already true; the witness pins the
+/// uniform rule the TLS backends now share, and fails if a future change
+/// starts counting inbound bytes on this arm.)
+#[test]
+fn inbound_bytes_do_not_extend_a_blocked_plaintext_flush() {
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let (options, server) = server(move |mut socket| {
+        startup(&mut socket);
+        assert_eq!(frame(&mut socket).0, b'Q');
+        // CopyInResponse, one text column.
+        message(&mut socket, b'G', &[0, 0, 1, 0, 0]);
+        // Stop reading; keep the wire alive from our side instead.
+        for _ in 0..12 {
+            if socket.write_all(&[0]).is_err() {
+                return;
+            }
+            let _ = socket.flush();
+            thread::sleep(BOUND / 4);
+        }
+        stopped.recv_timeout(WATCHDOG * 2).unwrap();
+    });
+    test_block_on(async {
+        let mut connection = options.connect().await.unwrap();
+        let mut copy = connection
+            .copy_in_raw("COPY test FROM STDIN")
+            .await
+            .unwrap();
+        let data = vec![0_u8; 64 * 1024];
+        let (error, waited) = timeout(WATCHDOG, async {
+            let mut last_accepted = std::time::Instant::now();
+            loop {
+                match copy.send(data.as_slice()).await {
+                    Ok(_) => last_accepted = std::time::Instant::now(),
+                    Err(error) => return (error, last_accepted.elapsed()),
+                }
+            }
+        })
+        .await
+        .expect("the outbound window must fill and the bound must fire");
+        stop.send(()).unwrap();
+        assert_timeout(error);
+        assert!(
+            waited >= BOUND,
+            "the flush failed before one bound of outbound silence: {waited:?}"
+        );
+        assert!(
+            waited < BOUND + BOUND / 2,
+            "an inbound byte extended the outgoing wait ({waited:?}); outgoing waits \
+             count outbound progress only"
+        );
+    });
+    server.join().unwrap();
+}
+
 fn successful_query(socket: &mut TcpStream, status: &[u8]) {
     loop {
         match frame(socket).0 {
@@ -738,6 +796,10 @@ mod tls_progress {
             self.inner.last_transport_progress()
         }
 
+        fn last_send_progress(&self) -> Option<Instant> {
+            self.inner.last_send_progress()
+        }
+
         fn has_incomplete_incoming_record(&self) -> bool {
             // Record framing above this transport is what can be part-way
             // through; a raw socket has no framing of its own.
@@ -1255,11 +1317,12 @@ mod tls_progress {
             }
             peer.tcp.flush().unwrap();
 
-            // Silence well past the client's bound: a wait armed by the
-            // control record would already be poisoned here. Then a real,
-            // well-formed NotificationResponse (pid, channel, empty payload),
-            // which the same session must still deliver.
-            thread::sleep(BOUND * 4);
+            // Silence for EIGHT bounds — twice the client's four-bound floor,
+            // so host jitter in either process cannot cross the assertion. A
+            // wait armed by the control record would already be poisoned one
+            // bound in. Then a real, well-formed NotificationResponse (pid,
+            // channel, empty payload), which the same session must deliver.
+            thread::sleep(BOUND * 8);
             let mut payload = vec![0, 0, 0, 8];
             payload.extend_from_slice(b"chan\0");
             payload.push(0);
@@ -1496,6 +1559,96 @@ mod tls_progress {
                     "the prefix arrived at the entry; one bound from there: waited {elapsed:?}"
                 ),
             }
+        });
+        let _ = stop.send(());
+        server.join().unwrap();
+    }
+
+    /// billing-7t7r P2 (grok): an OUTGOING wait is extended only by OUTBOUND
+    /// transport progress, on every backend. A peer that stops reading while
+    /// streaming us data must not hold a blocked flush open: the flush fires
+    /// one bound after the last byte the transport ACCEPTED from us.
+    ///
+    /// The peer answers the LISTEN exchange, then never reads again and sends
+    /// one TLS 1.3 KeyUpdate control record every quarter bound for three
+    /// bounds. The client fills its outbound window with 64 KiB writes until
+    /// one wait blocks; that wait is the one under test. Before this fix
+    /// rustls's `complete_io` read those records inside the blocked wait and
+    /// re-anchored the bound to each inbound byte, pushing the timeout past
+    /// the end of the stream while native-tls and plaintext already ignored
+    /// them — the mismatch this witness makes uniform.
+    #[test]
+    fn inbound_ciphertext_does_not_extend_a_blocked_outbound_flush() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let mut peer = TlsPeer::accept(listener.accept().unwrap().0);
+            peer.startup();
+            assert_eq!(peer.read_frame().0, b'Q'); // LISTEN
+            peer.write_plain(&[message(b'C', b"LISTEN\0"), message(b'Z', b"I")].concat());
+            // From here the peer only SENDS, and sends CONTROL records: a TLS
+            // 1.3 KeyUpdate adds no plaintext, so the client's session keeps
+            // reading the wire while its outbound window is full — the
+            // condition under test. (Application data would make rustls stop
+            // reading once its plaintext buffer is non-empty.) Once the
+            // client has concluded (it closes with unread data, so its close
+            // is an RST), a send fails; the witness has already been decided,
+            // so the peer stops instead of failing the test.
+            for _ in 0..12 {
+                // Errs before TLS 1.3, so this is also the assertion that the
+                // control record is possible at all.
+                peer.conn
+                    .refresh_traffic_keys()
+                    .expect("a TLS 1.3 KeyUpdate");
+                while peer.conn.wants_write() {
+                    if peer.conn.write_tls(&mut peer.tcp).is_err() {
+                        return;
+                    }
+                }
+                thread::sleep(BOUND / 4);
+            }
+            let _ = stopped.recv_timeout(Duration::from_secs(10));
+        });
+
+        test_block_on(async {
+            let reads = Arc::new(RawReads::default());
+            let boot = timeout(WATCHDOG, bootstrap(port, reads))
+                .await
+                .expect("bootstrap must complete");
+            let mut socket = boot.socket;
+            socket.set_io_timeout(Some(BOUND));
+            let chunk = vec![0u8; 64 * 1024];
+
+            let (error, waited) = timeout(WATCHDOG, async {
+                let mut last_accepted = Instant::now();
+                loop {
+                    socket.write(chunk.as_slice()).expect("buffer one chunk");
+                    match socket.flush().await {
+                        Ok(()) => last_accepted = Instant::now(),
+                        Err(error) => return (error, last_accepted.elapsed()),
+                    }
+                }
+            })
+            .await
+            .expect("the outbound window must fill and the bound must fire");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<sqlx_core::error::SocketTimedOut>()),
+                "the wait must carry the configured bound: {error:?}"
+            );
+            assert!(
+                waited >= BOUND,
+                "the flush failed before one bound of outbound silence: {waited:?}"
+            );
+            assert!(
+                waited < BOUND + BOUND / 2,
+                "an inbound record extended the outgoing wait ({waited:?}); outgoing waits \
+                 count outbound progress only"
+            );
         });
         let _ = stop.send(());
         server.join().unwrap();

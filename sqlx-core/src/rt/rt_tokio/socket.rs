@@ -11,12 +11,15 @@ use crate::net::Socket;
 
 /// A tokio `TcpStream` that records the instant of the last byte it moved.
 ///
-/// Every transport reports transport progress through [`Socket`], so the
-/// inactivity bound is anchored to real wire activity on EVERY socket — there
-/// is no default an implementation can silently omit.
+/// Every transport reports transport progress through [`Socket`]: the last
+/// byte moved in EITHER direction (read waits) and the last byte moved
+/// OUTBOUND (write, flush and shutdown waits), so the inactivity bound is
+/// anchored to real wire activity on EVERY socket — there is no default an
+/// implementation can silently omit.
 pub struct TrackedTcpStream {
     inner: TcpStream,
     last: Option<Instant>,
+    last_send: Option<Instant>,
 }
 
 impl TrackedTcpStream {
@@ -24,6 +27,7 @@ impl TrackedTcpStream {
         Self {
             inner,
             last: None,
+            last_send: None,
         }
     }
 }
@@ -41,7 +45,9 @@ impl Socket for TrackedTcpStream {
     fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.inner.try_write(buf)?;
         if written > 0 {
-            self.last = Some(Instant::now());
+            let now = Instant::now();
+            self.last = Some(now);
+            self.last_send = Some(now);
         }
         Ok(written)
     }
@@ -62,6 +68,10 @@ impl Socket for TrackedTcpStream {
         self.last
     }
 
+    fn last_send_progress(&self) -> Option<Instant> {
+        self.last_send
+    }
+
     fn has_incomplete_incoming_record(&self) -> bool {
         // A plaintext transport has no record framing to be part-way through.
         false
@@ -74,6 +84,7 @@ impl Socket for TrackedTcpStream {
 pub struct TrackedUnixStream {
     inner: tokio::net::UnixStream,
     last: Option<Instant>,
+    last_send: Option<Instant>,
 }
 
 #[cfg(unix)]
@@ -82,6 +93,7 @@ impl TrackedUnixStream {
         Self {
             inner,
             last: None,
+            last_send: None,
         }
     }
 }
@@ -99,7 +111,9 @@ impl Socket for TrackedUnixStream {
     fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.inner.try_write(buf)?;
         if written > 0 {
-            self.last = Some(Instant::now());
+            let now = Instant::now();
+            self.last = Some(now);
+            self.last_send = Some(now);
         }
         Ok(written)
     }
@@ -118,6 +132,10 @@ impl Socket for TrackedUnixStream {
 
     fn last_transport_progress(&self) -> Option<Instant> {
         self.last
+    }
+
+    fn last_send_progress(&self) -> Option<Instant> {
+        self.last_send
     }
 
     fn has_incomplete_incoming_record(&self) -> bool {

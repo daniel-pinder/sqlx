@@ -76,6 +76,13 @@ impl<S: Socket> Socket for RustlsSocket<S> {
         self.inner.last_transport_progress()
     }
 
+    fn last_send_progress(&self) -> Option<std::time::Instant> {
+        // Ciphertext the transport under this session ACCEPTED from us.
+        // Plaintext accepted into the session's send buffer is not progress:
+        // it costs nothing on the wire until complete_io drains it.
+        self.inner.last_send_progress()
+    }
+
     fn has_incomplete_incoming_record(&self) -> bool {
         // rustls holds the first half of a record internally after a read
         // completes; without this the next idle wait cannot see it.

@@ -35,6 +35,13 @@ witnesses=(
     # Transport progress on the TLS arm: an idle wait opened after the last
     # byte still fires one bound from THAT byte.
     tls_progress::a_delayed_idle_wait_is_not_granted_a_fresh_bound
+    # OUTGOING waits count outbound progress only, on both arms (billing-7t7r
+    # P2, grok): a blocked COPY send is not extended by bytes the peer
+    # streams back...
+    inbound_bytes_do_not_extend_a_blocked_plaintext_flush
+    # ...and a blocked TLS outbound wait is not extended by inbound
+    # ciphertext, even though the session reads it while the window is full.
+    tls_progress::inbound_ciphertext_does_not_extend_a_blocked_outbound_flush
 )
 
 for witness in "${witnesses[@]}"; do
