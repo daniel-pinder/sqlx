@@ -204,8 +204,19 @@ where
         close_notify_sent: false,
     };
 
-    // Performs the TLS handshake or bails
+    // Performs the TLS handshake or bails. rustls's `complete_io` can return
+    // once there is no I/O it can do RIGHT NOW while the connection still
+    // reports `is_handshaking` (TLS 1.3 may leave a flight outstanding); the
+    // native-tls backend loops until its handshake is final, so a rustls
+    // session used to finish negotiation on the first query instead — outside
+    // the setup deadline (codex P2). Wait for the handshake to actually
+    // finish here, bounded by the same outer future the caller applies to
+    // setup.
     socket.complete_io().await?;
+    while socket.state.is_handshaking() {
+        socket.inner.ready().await?;
+        socket.complete_io().await?;
+    }
 
     Ok(socket)
 }

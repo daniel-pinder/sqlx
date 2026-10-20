@@ -1129,6 +1129,168 @@ mod tls_progress {
         server.join().unwrap();
     }
 
+    /// Codex P2: the rustls backend must finish negotiation INSIDE the setup
+    /// deadline. A server that paces its first handshake flight over several
+    /// bounds must make `connect()` fail AT the bound, exactly as native-tls
+    /// already does; rustls's `complete_io` used to return while
+    /// `is_handshaking` was still true, so the connection resolved early and
+    /// the remaining flight was negotiated by later buffered flushes, outside
+    /// the deadline (~920 ms measured with a 250 ms bound).
+    ///
+    /// A raw TCP listener answers the SSLRequest, reads the client's
+    /// ClientHello through a capture sink so the server's first flight can be
+    /// PACED, then dribbles it at 64 bytes every 60 ms.
+    #[test]
+    fn a_paced_tls_handshake_is_bounded_inside_the_setup_deadline() {
+        struct Capture {
+            tcp: TcpStream,
+            out: Vec<u8>,
+        }
+
+        impl Read for Capture {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.tcp.read(buf)
+            }
+        }
+
+        impl Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.out.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut tcp = listener.accept().unwrap().0;
+            let mut request = [0u8; 8];
+            tcp.read_exact(&mut request).unwrap();
+            assert_eq!(&request[4..], &80877103_u32.to_be_bytes());
+            tcp.write_all(b"S").unwrap();
+            tcp.flush().unwrap();
+
+            let mut conn = rustls::ServerConnection::new(server_config()).unwrap();
+            // Read the ClientHello and process it without `complete_io`'s
+            // read-after-write: the response flight is captured, not sent, so
+            // the test can pace it.
+            loop {
+                let read = conn.read_tls(&mut tcp).unwrap();
+                assert!(read > 0, "the client closed before the ClientHello");
+                conn.process_new_packets()
+                    .expect("the ClientHello is well formed");
+                if conn.wants_write() {
+                    break;
+                }
+            }
+            let mut capture = Capture {
+                tcp: tcp.try_clone().unwrap(),
+                out: Vec::new(),
+            };
+            while conn.wants_write() {
+                conn.write_tls(&mut capture).unwrap();
+            }
+            let flight = capture.out;
+            assert!(!flight.is_empty(), "the server produced a handshake flight");
+            for chunk in flight.chunks(64) {
+                // The client's deadline may already have closed the socket;
+                // that is the outcome under test.
+                if tcp.write_all(chunk).is_err() {
+                    break;
+                }
+                let _ = tcp.flush();
+                thread::sleep(Duration::from_millis(60));
+            }
+            // Keep the connection open while the client's deadline decides.
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        test_block_on(async {
+            let started = Instant::now();
+            let error = timeout(WATCHDOG, options(port).connect())
+                .await
+                .expect("connect must return inside the watchdog")
+                .expect_err("a handshake paced past the setup deadline must not connect");
+            let elapsed = started.elapsed();
+            assert_timeout(error);
+            assert!(
+                elapsed < WATCHDOG / 2,
+                "connect returned after {elapsed:?}; negotiation escaped the setup deadline"
+            );
+        });
+        server.join().unwrap();
+    }
+
+    /// Codex P1 / messaging's required witness: a COMPLETE TLS control record
+    /// (a TLS 1.3 KeyUpdate) arriving on an idle LISTEN connection is
+    /// keep-alive traffic, not the start of a message. It extends the
+    /// inactivity deadline (the transport is alive) but must not arm it, so
+    /// the listener survives well past the bound and still receives the next
+    /// real notification. Before the fix the control record armed the wait
+    /// and poisoned the connection one bound later.
+    ///
+    /// The client backend is whichever the feature set selected — this witness
+    /// runs on tokio/rustls, async-io/rustls and tokio/native-tls; the peer is
+    /// a rustls SERVER in every case.
+    #[test]
+    fn a_complete_tls_control_record_does_not_arm_the_idle_listener_bound() {
+        let (options, server) = listener(|mut peer| {
+            peer.startup();
+            assert_eq!(peer.read_frame().0, b'Q'); // LISTEN
+            peer.write_plain(&[message(b'C', b"LISTEN\0"), message(b'Z', b"I")].concat());
+            // One COMPLETE control record, sealed into its own TLS record.
+            // `refresh_traffic_keys` errs on a version before TLS 1.3, so the
+            // expect is also the assertion that a KeyUpdate is possible at all.
+            peer.conn
+                .refresh_traffic_keys()
+                .expect("a TLS 1.3 KeyUpdate control record");
+            while peer.conn.wants_write() {
+                peer.conn.write_tls(&mut peer.tcp).unwrap();
+            }
+            peer.tcp.flush().unwrap();
+
+            // Silence well past the client's bound: a wait armed by the
+            // control record would already be poisoned here. Then a real,
+            // well-formed NotificationResponse (pid, channel, empty payload),
+            // which the same session must still deliver.
+            thread::sleep(BOUND * 4);
+            let mut payload = vec![0, 0, 0, 8];
+            payload.extend_from_slice(b"chan\0");
+            payload.push(0);
+            peer.write_plain(&message(b'A', &payload));
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        test_block_on(async {
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(WATCHDOG)
+                .connect_lazy_with(options);
+            let mut listener = PgListener::connect_with(&pool).await.unwrap();
+            listener.listen("chan").await.unwrap();
+            listener.eager_reconnect(false);
+
+            let started = Instant::now();
+            let notification = timeout(WATCHDOG, listener.try_recv())
+                .await
+                .expect("a control record must not poison the idle wait")
+                .expect("a poisoned connection is not a query error");
+            let notification =
+                notification.expect("the notification after the control record must arrive");
+            assert_eq!(notification.channel(), "chan");
+            assert!(
+                started.elapsed() >= BOUND * 4,
+                "the wait returned after {:?}, before the peer's silence ended",
+                started.elapsed()
+            );
+        });
+        server.join().unwrap();
+    }
+
     /// The ENTRY window of ruling (d), on the public listener: a read that
     /// COMPLETES can pull the first half of the NEXT TLS record into the
     /// session at the same time. The idle wait that follows then has empty
