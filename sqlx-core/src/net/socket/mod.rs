@@ -273,12 +273,13 @@ pub async fn connect_tcp<Ws: WithSocket>(
 /// The return type is CONCRETE on purpose: the caller wraps it in
 /// [`crate::rt::rt_async_io::socket::TrackedTcpStream`], which is what
 /// implements [`Socket`] and records transport progress. Returning
-/// `impl Socket` here compiled only against upstream's blanket impl for
-/// `async_io::Async<TcpStream>`; in the fork that impl is the tracked wrapper,
-/// so an opaque `impl Socket` is neither constructible from the raw stream nor
-/// acceptable to `TrackedTcpStream::new`. Naming the raw type keeps the
-/// wrapping — and therefore the progress semantics — identical on both
-/// runtime arms.
+/// `impl Socket` here compiled only against upstream's CONCRETE impl for
+/// `async_io::Async<TcpStream>` (upstream has a second for
+/// `Async<UnixStream>`; neither is generic over the stream type); in the fork
+/// the TCP impl is the tracked wrapper, so an opaque `impl Socket` is neither
+/// constructible from the raw stream nor acceptable to
+/// `TrackedTcpStream::new`. Naming the raw type keeps the wrapping — and
+/// therefore the progress semantics — identical on both runtime arms.
 #[cfg(feature = "_rt-async-io")]
 async fn connect_tcp_async_io(
     host: &str,

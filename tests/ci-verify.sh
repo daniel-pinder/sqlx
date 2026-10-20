@@ -21,7 +21,9 @@
 # and `--all-features` failed to compile while the `_rt-tokio` suite stayed
 # green. tests/fork-check.sh compiles BOTH runtime arms (together and each
 # alone) and runs the all-features doctest; it runs here so the arm the suite
-# does not exercise is still compiled by every heavy gate.
+# does not exercise is still compiled by every heavy gate. The async-io arm is
+# additionally RUN by tests/socket-timeout-async-io.sh (billing-7t7r.2), which
+# replays the key socket_timeout witnesses through its tracked wrapper.
 #
 # `--all-features` reaches aws-lc-sys (cmake + a C compiler) and bindgen
 # (libclang at runtime). The fleet runner image installs cmake and
@@ -33,6 +35,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 tests/fork-check.sh
+
+# The async-io arm is not only compiled, it is RUN: the key socket_timeout
+# witnesses execute through rt_async_io's tracked wrapper on an async-io
+# reactor (billing-7t7r.2). See the script header for the arm-selection
+# mechanism and the red proof recorded on the bead.
+tests/socket-timeout-async-io.sh
 
 cargo test --locked -p sqlx-core --features _rt-tokio,any,sqlx-toml
 

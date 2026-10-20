@@ -25,10 +25,11 @@
 # and bindgen (libclang at runtime). The fleet runner image carries cmake and
 # libclang1-19; a failure naming those is an image problem, not a code one.
 #
-# The socket-timeout WITNESSES remain Tokio-only: they are `#[tokio::test]`
-# cases around scripted loopback peers, and sqlx-postgres's test harness
-# offers no async-io reactor. Their run is ci-verify.sh's; the async-io arm is
-# covered here by compilation, which is the property this script exists for.
+# This script covers the async-io arm by COMPILATION. Its runtime coverage is
+# tests/socket-timeout-async-io.sh: the witnesses are plain `#[test]` cases
+# around scripted loopback peers driven by `test_block_on`, which resolves to
+# `async_io::block_on` whenever `_rt-async-io` is enabled (see sqlx-core's
+# src/rt/mod.rs), so the same cases run through the tracked async-io wrapper.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
